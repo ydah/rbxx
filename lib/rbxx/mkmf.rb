@@ -26,7 +26,9 @@ module Rbxx
       target_name = File.basename(target)
       configure, build = cmake_commands(source_dir, build_dir)
       extension = "#{target_name}.#{RbConfig::CONFIG.fetch('DLEXT')}"
-      File.write("Makefile", cmake_makefile(configure, build, build_dir, extension))
+      makefile = cmake_makefile(configure, build, build_dir, extension,
+                                unexport_make: RUBY_PLATFORM.include?("mingw"))
+      File.write("Makefile", makefile)
     end
 
     def cmake_commands(source_dir, build_dir, cxx: RbConfig::CONFIG.fetch("CXX"),
@@ -40,19 +42,14 @@ module Rbxx
       configure << "-DCMAKE_CXX_FLAGS_INIT=#{compiler_flags.join(' ')}" unless compiler_flags.empty?
       build = ["cmake", "--build", build_dir, "--config", "Release"]
 
-      if platform.include?("mingw")
-        configure.push("-G", "MinGW Makefiles")
-        clean_environment = ["cmake", "-E", "env", "--unset=MAKE"]
-        configure = clean_environment + configure
-        build = clean_environment + build
-      end
+      configure.push("-G", "MinGW Makefiles") if platform.include?("mingw")
 
       [configure, build]
     end
 
-    def cmake_makefile(configure, build, build_dir, extension)
+    def cmake_makefile(configure, build, build_dir, extension, unexport_make: false)
       built_extension = File.join(build_dir, extension)
-      [
+      lines = [
         ".PHONY: all clean install", "", "all:", "\t#{Shellwords.join(configure)}",
         "\t#{Shellwords.join(build)}",
         "\tcmake -E copy #{Shellwords.escape(built_extension)} #{Shellwords.escape(extension)}", "",
@@ -60,7 +57,9 @@ module Rbxx
         "\tcmake -E copy #{Shellwords.escape(extension)} $(sitearchdir)/#{extension}", "", "clean:",
         "\tcmake -E remove_directory #{Shellwords.escape(build_dir)}",
         "\tcmake -E rm -f #{Shellwords.escape(extension)}", ""
-      ].join("\n")
+      ]
+      lines.unshift("unexport MAKE", "") if unexport_make
+      lines.join("\n")
     end
 
     def debug?

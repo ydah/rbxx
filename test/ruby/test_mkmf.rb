@@ -40,10 +40,10 @@ class MkmfTest < Minitest::Test
     configure, build = Rbxx::Mkmf.cmake_commands("/project/ext", "cmake-build",
                                                  cxx: "g++ -std=gnu++11",
                                                  platform: "x64-mingw-ucrt")
-    clean_environment = ["cmake", "-E", "env", "--unset=MAKE"]
+    makefile = Rbxx::Mkmf.cmake_makefile(configure, build, "cmake-build", "demo.so",
+                                         unexport_make: true)
 
-    assert_equal clean_environment, configure.first(clean_environment.length)
-    assert_equal clean_environment, build.first(clean_environment.length)
+    assert_equal "unexport MAKE", makefile.lines.first.chomp
     assert_equal ["-G", "MinGW Makefiles"], configure.last(2)
   end
 end

@@ -62,7 +62,11 @@ jobs:
           libasan_path="$(gcc -print-file-name=libasan.so)"
           libstdcxx_path="$(g++ -print-file-name=libstdc++.so.6)"
           export LD_PRELOAD="${libasan_path}:${libstdcxx_path}"
-          bundle exec rake compile:test test test:gc_stress
+          bundle exec rake compile:test
+          for test_file in test/ruby/test_*.rb; do
+            bundle exec ruby -Ilib -Itmp/test_extensions "$test_file"
+            RBXX_GC_STRESS=1 bundle exec ruby -Ilib -Itmp/test_extensions "$test_file"
+          done
 
   lint:
     runs-on: ubuntu-24.04
