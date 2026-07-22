@@ -17,15 +17,25 @@ module RbxxTestHelpers
     skip "GC compaction is unavailable" unless GC.respond_to?(:verify_compaction_references)
 
     result = yield
-    GC.verify_compaction_references(expand_heap: true, toward: :empty)
+    options = { toward: :empty }
+    parameters = GC.method(:verify_compaction_references).parameters
+    heap_option = parameters.include?(%i[key expand_heap]) ? :expand_heap : :double_heap
+    GC.verify_compaction_references(**options, heap_option => true)
     result
   end
 
-  def assert_destructor_runs(counter_class)
+  def assert_destructor_runs(counter_class, &)
     before = counter_class.destroyed
-    yield
+    discard_result(&)
     5.times { GC.start }
     assert_operator counter_class.destroyed, :>, before
+  end
+
+  private
+
+  def discard_result
+    yield
+    nil
   end
 end
 

@@ -113,6 +113,7 @@ namespace :amalgamate do
   desc "Compile an extension using only the generated single header"
   task smoke: [:generate] do
     build_dir = File.join(ROOT, "tmp", "amalgamate_smoke")
+    FileUtils.rm_rf(build_dir)
     FileUtils.mkdir_p(build_dir)
     File.write(File.join(build_dir, "single_header_smoke.cpp"), <<~CPP)
       #include <rbxx/rbxx.hpp>
@@ -126,7 +127,7 @@ namespace :amalgamate do
       create_makefile("single_header_smoke")
     RUBY
     Dir.chdir(build_dir) do
-      sh RbConfig.ruby, "extconf.rb" unless File.exist?("Makefile")
+      sh RbConfig.ruby, "extconf.rb"
       sh RbConfig::CONFIG.fetch("MAKE", "make")
     end
   end

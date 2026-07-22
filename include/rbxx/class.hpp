@@ -533,12 +533,12 @@ public:
   }
 
   /// @brief Defines a Ruby reader for a public C++ data member.
-  template <typename Member> class_& def_attr_reader(const char* name, Member T::* member) {
+  template <typename Member> class_& def_attr_reader(const char* name, Member T::*member) {
     return def(name, [member](const T& self) -> const Member& { return self.*member; });
   }
 
   /// @brief Defines a Ruby writer for a public C++ data member.
-  template <typename Member> class_& def_attr_writer(const char* name, Member T::* member) {
+  template <typename Member> class_& def_attr_writer(const char* name, Member T::*member) {
     std::string writer = std::string(name) + "=";
     return def(writer.c_str(), [member](T& self, Member updated) {
       self.*member = std::move(updated);
@@ -547,7 +547,7 @@ public:
   }
 
   /// @brief Defines Ruby reader and writer methods for a public C++ data member.
-  template <typename Member> class_& def_attr_accessor(const char* name, Member T::* member) {
+  template <typename Member> class_& def_attr_accessor(const char* name, Member T::*member) {
     def_attr_reader(name, member);
     return def_attr_writer(name, member);
   }

@@ -28,4 +28,9 @@
 #define RBXX_RUBY_VERSION_MINOR RUBY_API_VERSION_MINOR
 #define RBXX_RUBY_VERSION_TEENY RUBY_API_VERSION_TEENY
 
+#if RUBY_API_VERSION_MAJOR < 4
+// CRuby exports this debug helper before 4.0 but does not declare it in ruby/thread.h.
+extern "C" int ruby_thread_has_gvl_p(void);
+#endif
+
 static_assert(RUBY_API_VERSION_MAJOR >= 3, "rbxx requires CRuby 3.1 or newer");
