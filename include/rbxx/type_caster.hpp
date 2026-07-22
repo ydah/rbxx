@@ -100,6 +100,9 @@ inline const char* checked_string_pointer(value input) {
 }
 
 inline VALUE checked_string_value(value input) {
+  if (input.is_string()) {
+    return input.raw();
+  }
   VALUE converted = protect(rb_check_string_type, input.raw());
   if (NIL_P(converted)) {
     throw_type_error("String or object responding to #to_str", input);
@@ -146,7 +149,12 @@ template <> struct type_caster<bool> {
 
 template <> struct type_caster<float> {
   static constexpr std::string_view name = "Float";
-  static float load(value input) { return static_cast<float>(protect(rb_num2dbl, input.raw())); }
+  static float load(value input) {
+    if (input.is_float()) {
+      return static_cast<float>(RFLOAT_VALUE(input.raw()));
+    }
+    return static_cast<float>(protect(rb_num2dbl, input.raw()));
+  }
   static value dump(float input) {
     return value{protect(rb_float_new, static_cast<double>(input))};
   }
@@ -155,7 +163,9 @@ template <> struct type_caster<float> {
 
 template <> struct type_caster<double> {
   static constexpr std::string_view name = "Float";
-  static double load(value input) { return protect(rb_num2dbl, input.raw()); }
+  static double load(value input) {
+    return input.is_float() ? RFLOAT_VALUE(input.raw()) : protect(rb_num2dbl, input.raw());
+  }
   static value dump(double input) { return value{protect(rb_float_new, input)}; }
   static bool matches(value input) noexcept { return input.is_float() || input.is_integer(); }
 };

@@ -11,3 +11,12 @@
 .rspec_status
 Gemfile.lock
 *.gem
+*.bundle
+*.dll
+*.dSYM/
+*.o
+*.so
+mkmf.log
+/bench/ext/*/Makefile
+/examples/**/Makefile
+/examples/**/cmake-build/

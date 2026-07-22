@@ -70,7 +70,8 @@ module Rbxx
 
       cppflags = " -I#{Shellwords.escape(include_path)}"
       cppflags += " -DRBXX_DEBUG=1" if debug
-      cxxflags = " -std=c++20 -Wall -Wextra -fvisibility=hidden"
+      optimization = debug ? "-O0 -g" : RbConfig::CONFIG.fetch("optflags", "-O2")
+      cxxflags = " #{optimization} -std=c++20 -Wall -Wextra -fvisibility=hidden"
       cxxflags += " -fsanitize=address,undefined -fno-omit-frame-pointer" if sanitize
       ldflags = sanitize ? " -fsanitize=address,undefined" : ""
       { cppflags:, cxxflags:, ldflags: }
@@ -79,7 +80,8 @@ module Rbxx
     def msvc_flags(include_path, debug:)
       cppflags = %( /I"#{include_path}")
       cppflags += " /DRBXX_DEBUG=1" if debug
-      { cppflags:, cxxflags: " /std:c++20 /EHsc /utf-8 /W4", ldflags: "" }
+      optimization = debug ? "/Od /Zi" : "/O2"
+      { cppflags:, cxxflags: " #{optimization} /std:c++20 /EHsc /utf-8 /W4", ldflags: "" }
     end
 
     # mkmf exposes compiler configuration exclusively through these globals.

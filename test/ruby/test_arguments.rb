@@ -62,4 +62,11 @@ class ArgumentsTest < Minitest::Test
     assert_operator box, :<, sum
     assert_equal 6, box[2]
   end
+
+  def test_compile_time_fast_path_falls_back_when_overloaded
+    object = Arguments::OverloadedMember.new
+
+    assert_equal 1, object.pick
+    assert_equal 5, object.pick(4)
+  end
 end

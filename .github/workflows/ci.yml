@@ -82,6 +82,7 @@ jobs:
       - run: bundle exec rake precompiled:dry_run
       - run: cmake -S examples/cmake-demo -B tmp/cmake-demo
       - run: cmake --build tmp/cmake-demo
+      - run: bundle exec rake bench:compile_time
 
   precompiled-linux:
     runs-on: ubuntu-latest

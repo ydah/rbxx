@@ -7,13 +7,28 @@ require "rake/clean"
 require "rake/testtask"
 require "open3"
 require "shellwords"
+require "benchmark"
 require_relative "lib/rbxx/rake_tasks"
 
 ROOT = File.expand_path(__dir__)
 TEST_BUILD_ROOT = File.join(ROOT, "tmp", "test_extensions")
 TEST_SOURCES = FileList[File.join(ROOT, "test", "cpp", "*.cpp")]
+BENCH_EXTENSION_ROOT = File.join(ROOT, "bench", "ext")
 
 CLEAN.include(TEST_BUILD_ROOT)
+CLEAN.include(File.join(BENCH_EXTENSION_ROOT, "**", "Makefile"))
+CLEAN.include(File.join(BENCH_EXTENSION_ROOT, "**", "*.{o,bundle,so,dll}"))
+
+def syntax_command(source)
+  includes = [File.join(ROOT, "include"), RbConfig::CONFIG.fetch("rubyhdrdir"),
+              RbConfig::CONFIG.fetch("rubyarchhdrdir")]
+  compiler = Shellwords.split(RbConfig::CONFIG.fetch("CXX"))
+  if File.basename(compiler.first).match?(/\Acl(?:\.exe)?\z/i)
+    compiler + ["/std:c++20", "/Zs", *includes.map { |path| %(/I"#{path}") }, source]
+  else
+    compiler + ["-std=c++20", "-fsyntax-only", *includes.map { |path| "-I#{path}" }, source]
+  end
+end
 
 namespace :compile do
   desc "Build all native test extensions"
@@ -61,10 +76,7 @@ namespace :test do
   task :compile_fail do
     FileList[File.join(ROOT, "test", "compile_fail", "*.cpp")].each do |source|
       expected = File.foreach(source).first.to_s.delete_prefix("// EXPECT:").strip
-      includes = [File.join(ROOT, "include"), RbConfig::CONFIG.fetch("rubyhdrdir"),
-                  RbConfig::CONFIG.fetch("rubyarchhdrdir")]
-      command = [RbConfig::CONFIG.fetch("CXX"), "-std=c++20", "-fsyntax-only",
-                 *includes.map { |path| "-I#{path}" }, source]
+      command = syntax_command(source)
       _stdout, stderr, status = Open3.capture3(*command)
       raise "#{source} unexpectedly compiled" if status.success?
       raise "#{source} did not contain expected diagnostic: #{expected}\n#{stderr}" unless stderr.include?(expected)
@@ -124,3 +136,34 @@ desc "Generate the rbxx single header"
 task amalgamate: "amalgamate:generate"
 
 Rbxx::RakeTasks.install(command: "bundle install && rake amalgamate:smoke")
+
+namespace :bench do
+  desc "Build the hand-written C, rbxx, and Rice benchmark extensions"
+  task :build do
+    %w[c rbxx rice].each do |implementation|
+      directory = File.join(BENCH_EXTENSION_ROOT, implementation)
+      Dir.chdir(directory) do
+        sh RbConfig::CONFIG.fetch("MAKE", "make"), "clean" if File.exist?("Makefile")
+        sh RbConfig.ruby, "extconf.rb"
+        sh RbConfig::CONFIG.fetch("MAKE", "make")
+      end
+    end
+  end
+
+  desc "Run the native binding comparison benchmark"
+  task run: :build do
+    paths = %w[c rbxx rice].map { |name| File.join(BENCH_EXTENSION_ROOT, name) }
+    sh({ "RUBYLIB" => paths.join(File::PATH_SEPARATOR) }, RbConfig.ruby,
+       File.join(ROOT, "bench", "bindings.rb"))
+  end
+
+  desc "Measure syntax-only compilation of a representative binding"
+  task :compile_time do
+    source = File.join(ROOT, "test", "cpp", "arguments.cpp")
+    elapsed = Benchmark.realtime do
+      _stdout, stderr, status = Open3.capture3(*syntax_command(source))
+      raise "representative binding did not compile:\n#{stderr}" unless status.success?
+    end
+    puts format("representative binding syntax check: %.3f s", elapsed)
+  end
+end

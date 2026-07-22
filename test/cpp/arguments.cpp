@@ -55,6 +55,11 @@ struct number_box {
   int number;
 };
 
+struct overloaded_member {
+  [[nodiscard]] int pick() const { return 1; }
+  [[nodiscard]] int pick(int input) const { return input + 1; }
+};
+
 } // namespace
 
 RBXX_EXTENSION(arguments) {
@@ -85,4 +90,8 @@ RBXX_EXTENSION(arguments) {
       .def(rx::op::add, &number_box::add)
       .def(rx::op::compare, &number_box::compare)
       .def(rx::op::index, &number_box::index);
+  arguments.def_class<overloaded_member>("OverloadedMember")
+      .def(rx::init<>())
+      .def<static_cast<int (overloaded_member::*)() const>(&overloaded_member::pick)>("pick")
+      .def("pick", static_cast<int (overloaded_member::*)(int) const>(&overloaded_member::pick));
 }

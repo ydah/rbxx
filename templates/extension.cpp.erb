@@ -19,5 +19,5 @@ RBXX_EXTENSION(<%= name %>) {
   root.def_class<counter>("Counter")
       .def(rbxx::init<int>(), rbxx::kwarg("start") = 0)
       .def("increment", &counter::increment)
-      .def("value", &counter::value);
+      .def<&counter::value>("value");
 }

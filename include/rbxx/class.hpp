@@ -2,8 +2,11 @@
 
 #include <rbxx/module.hpp>
 
+#include <array>
+#include <cstddef>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -47,6 +50,127 @@ struct member_method_traits<Return (Class::*)(Args...) const noexcept>
 
 inline void define_instance_trampoline(VALUE klass, const char* name) {
   protect([klass, name] { rb_define_method(klass, name, function_trampoline, -1); });
+}
+
+struct fast_zero_slot {
+  VALUE (*invoke)(void*, VALUE);
+  void* context;
+};
+
+inline constexpr std::size_t fast_zero_slot_count = 64U;
+
+inline std::array<fast_zero_slot, fast_zero_slot_count>& fast_zero_slots() {
+  static auto* slots = new std::array<fast_zero_slot, fast_zero_slot_count>{};
+  return *slots;
+}
+
+template <std::size_t Index> VALUE fast_zero_trampoline(VALUE self) {
+  VALUE result = Qnil;
+  VALUE pending = Qnil;
+  try {
+    const fast_zero_slot& slot = fast_zero_slots()[Index];
+    result = slot.invoke(slot.context, self);
+  } catch (...) {
+    pending = translate_current_exception();
+  }
+  if (!NIL_P(pending)) {
+    rb_exc_raise(pending);
+  }
+  return result;
+}
+
+using fast_zero_method = VALUE (*)(VALUE);
+
+template <std::size_t Index = 0U> fast_zero_method select_fast_zero_method(std::size_t selected) {
+  if constexpr (Index < fast_zero_slot_count) {
+    if (selected == Index) {
+      return &fast_zero_trampoline<Index>;
+    }
+    return select_fast_zero_method<Index + 1U>(selected);
+  }
+  return nullptr;
+}
+
+inline std::optional<std::size_t> add_fast_zero_slot(fast_zero_slot slot) {
+  static std::size_t next = 0U;
+  if (next == fast_zero_slot_count) {
+    return std::nullopt;
+  }
+  const std::size_t selected = next++;
+  fast_zero_slots()[selected] = slot;
+  return selected;
+}
+
+template <typename Bound> Bound& load_bound_fast(VALUE self) {
+  if (RB_TYPE_P(self, T_DATA) && RTYPEDDATA_P(self) &&
+      RTYPEDDATA_TYPE(self) == &typed_data_type<Bound>()) {
+    auto& wrapper = *static_cast<data_wrapper<Bound>*>(RTYPEDDATA_DATA(self));
+    if (wrapper.pointer == nullptr) {
+      throw ruby_error(make_exception(rb_eRuntimeError, "rbxx: C++ object is not initialized"));
+    }
+    return *wrapper.pointer;
+  }
+  return load_registered<Bound>(value{self});
+}
+
+template <typename Bound, typename Method> struct fast_member_context {
+  Method method;
+  policy::kind selected;
+};
+
+template <typename Bound, typename Method> VALUE invoke_fast_member(void* opaque, VALUE self) {
+  auto& context = *static_cast<fast_member_context<Bound, Method>*>(opaque);
+  Bound& native = load_bound_fast<Bound>(self);
+  using traits = member_method_traits<Method>;
+  if constexpr (std::is_void_v<typename traits::return_type>) {
+    std::invoke(context.method, native);
+    return Qnil;
+  } else {
+    decltype(auto) result = std::invoke(context.method, native);
+    return dump_result(std::forward<decltype(result)>(result), context.selected).raw();
+  }
+}
+
+template <typename Bound, typename Method>
+bool define_fast_member(VALUE klass, const char* name, Method method, policy::kind selected) {
+  auto context = std::make_unique<fast_member_context<Bound, Method>>(method, selected);
+  const auto slot =
+      add_fast_zero_slot(fast_zero_slot{&invoke_fast_member<Bound, Method>, context.get()});
+  if (!slot) {
+    return false;
+  }
+  fast_zero_method trampoline = select_fast_zero_method(*slot);
+  protect([klass, name, trampoline] { rb_define_method(klass, name, trampoline, 0); });
+  context.release();
+  return true;
+}
+
+template <typename Bound, auto Method> VALUE direct_member_trampoline(VALUE self) {
+  VALUE result = Qnil;
+  VALUE pending = Qnil;
+  try {
+    Bound& native = load_bound_fast<Bound>(self);
+    using traits = member_method_traits<decltype(Method)>;
+    if constexpr (std::is_void_v<typename traits::return_type>) {
+      std::invoke(Method, native);
+    } else {
+      decltype(auto) native_result = std::invoke(Method, native);
+      result =
+          dump_result(std::forward<decltype(native_result)>(native_result), policy::kind::automatic)
+              .raw();
+    }
+  } catch (...) {
+    pending = translate_current_exception();
+  }
+  if (!NIL_P(pending)) {
+    rb_exc_raise(pending);
+  }
+  return result;
+}
+
+template <typename Bound, auto Method> void define_direct_member(VALUE klass, const char* name) {
+  constexpr fast_zero_method trampoline = &direct_member_trampoline<Bound, Method>;
+  protect([klass, name] { rb_define_method(klass, name, trampoline, 0); });
 }
 
 template <typename T, typename... Args> class constructor_function final : public native_function {
@@ -302,6 +426,31 @@ public:
 
   [[nodiscard]] value get() const noexcept { return ruby_class_; }
 
+  /// @brief Defines a compile-time-bound zero-argument member on the minimal dispatch path.
+  /// @code binding.def<&Counter::value>("value"); @endcode
+  template <auto Method> class_& def(const char* name) {
+    using method_type = decltype(Method);
+    static_assert(std::is_member_function_pointer_v<method_type>,
+                  "rbxx: compile-time def requires a member function pointer");
+    using traits = detail::member_method_traits<method_type>;
+    static_assert(traits::arity == 0U,
+                  "rbxx: compile-time def currently supports zero-argument members");
+    static_assert(std::is_void_v<typename traits::return_type> ||
+                      to_ruby_convertible<typename traits::return_type>,
+                  "rbxx: member function return type has no type_caster");
+
+    ID method = protect(rb_intern, name);
+    const bool first = detail::method_registry::instance().add(
+        ruby_class_.raw(), method,
+        std::make_unique<detail::member_function<T, method_type>>(Method, policy::kind::automatic));
+    if (first) {
+      detail::define_direct_member<T, Method>(ruby_class_.raw(), name);
+    } else {
+      detail::define_instance_trampoline(ruby_class_.raw(), name);
+    }
+    return *this;
+  }
+
   template <typename... Args, typename... Specs>
     requires((std::is_convertible_v<Specs, argument_spec>) && ...)
   class_& def(init_tag<Args...>, Specs&&... specs) {
@@ -397,7 +546,7 @@ public:
     return def_attr_writer(name, member);
   }
 
-  /// @brief Defines #each, includes Enumerable, and returns sized enumerators without a block.
+  /// @brief Defines Ruby each, includes Enumerable, and returns sized enumerators without a block.
   template <auto Begin, auto End> class_& def_iterable() {
     using item_reference = decltype(*std::invoke(Begin, std::declval<T&>()));
     static_assert(to_ruby_convertible<item_reference>,
@@ -430,24 +579,29 @@ private:
       static_assert(detail::arguments_convertible<typename traits::args_tuple>(
                         std::make_index_sequence<traits::arity>{}),
                     "rbxx: member function argument type has no type_caster");
+      const bool fast = traits::arity == 0U && specs.empty() && keep_alive.empty();
       const bool first = detail::method_registry::instance().add(
           ruby_class_.raw(), method,
           std::make_unique<detail::member_function<T, stored_function>>(
               function, selected.value, std::move(specs), std::move(keep_alive)));
-      if (first) {
+      bool defined_fast = false;
+      if constexpr (traits::arity == 0U) {
+        defined_fast =
+            first && fast &&
+            detail::define_fast_member<T>(ruby_class_.raw(), name, function, selected.value);
+      }
+      if (!defined_fast) {
         detail::define_instance_trampoline(ruby_class_.raw(), name);
       }
     } else {
       static_assert(detail::function_signature<stored_function>,
                     "rbxx: instance callable signature cannot be determined");
-      const bool first = detail::method_registry::instance().add(
+      detail::method_registry::instance().add(
           ruby_class_.raw(), method,
           std::make_unique<detail::self_function<T, stored_function>>(
               std::forward<Function>(function), selected.value, std::move(specs),
               std::move(keep_alive)));
-      if (first) {
-        detail::define_instance_trampoline(ruby_class_.raw(), name);
-      }
+      detail::define_instance_trampoline(ruby_class_.raw(), name);
     }
     return *this;
   }

@@ -4,6 +4,7 @@
 
 #include <limits>
 #include <string>
+#include <type_traits>
 
 namespace rbxx::detail {
 
@@ -31,7 +32,12 @@ template <typename Range> value dump_array_range(const Range& input) {
   return value{protect([&input, size] {
     VALUE result = rb_ary_new_capa(static_cast<long>(size));
     for (const auto& element : input) {
-      rb_ary_push(result, to_ruby(element).raw());
+      using element_type = std::remove_cvref_t<decltype(element)>;
+      if constexpr (std::is_floating_point_v<element_type>) {
+        rb_ary_push(result, rb_float_new(static_cast<double>(element)));
+      } else {
+        rb_ary_push(result, to_ruby(element).raw());
+      }
     }
     return result;
   })};
