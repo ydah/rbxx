@@ -1,4 +1,5 @@
 AllCops:
+  CacheRootDirectory: tmp/rubocop_cache
   NewCops: enable
   SuggestExtensions: false
   TargetRubyVersion: 3.1

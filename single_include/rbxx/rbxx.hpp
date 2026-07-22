@@ -34,6 +34,353 @@
 static_assert(RUBY_API_VERSION_MAJOR >= 3, "rbxx requires CRuby 3.1 or newer");
 // END rbxx/detail/ruby_include.hpp
 
+// BEGIN rbxx/value.hpp
+
+
+#include <type_traits>
+
+namespace rbxx {
+
+/// @brief A zero-overhead, non-owning view of a Ruby VALUE.
+/// @code rbxx::value nil{Qnil}; @endcode
+class value {
+public:
+  /// @brief Constructs a nil value.
+  constexpr value() noexcept = default;
+
+  /// @brief Wraps a raw Ruby VALUE without pinning it.
+  /// @code auto wrapped = rbxx::value{Qtrue}; @endcode
+  explicit constexpr value(VALUE raw) noexcept : raw_(raw) {}
+
+  /// @brief Returns the wrapped Ruby VALUE.
+  /// @code VALUE raw = wrapped.raw(); @endcode
+  [[nodiscard]] constexpr VALUE raw() const noexcept { return raw_; }
+
+  /// @brief Returns whether this value is nil.
+  /// @code if (wrapped.is_nil()) { return; } @endcode
+  [[nodiscard]] constexpr bool is_nil() const noexcept { return NIL_P(raw_); }
+
+  /// @brief Returns whether this value is a Ruby boolean.
+  [[nodiscard]] constexpr bool is_bool() const noexcept { return raw_ == Qtrue || raw_ == Qfalse; }
+
+  /// @brief Returns whether this value is a Ruby Integer.
+  [[nodiscard]] bool is_integer() const noexcept { return RB_INTEGER_TYPE_P(raw_); }
+
+  /// @brief Returns whether this value is a Ruby Float.
+  [[nodiscard]] bool is_float() const noexcept { return RB_TYPE_P(raw_, T_FLOAT); }
+
+  /// @brief Returns whether this value is a Ruby String.
+  [[nodiscard]] bool is_string() const noexcept { return RB_TYPE_P(raw_, T_STRING); }
+
+  /// @brief Returns whether this value is a Ruby Symbol.
+  [[nodiscard]] bool is_symbol() const noexcept { return SYMBOL_P(raw_); }
+
+  /// @brief Returns whether this value is a Ruby Array.
+  [[nodiscard]] bool is_array() const noexcept { return RB_TYPE_P(raw_, T_ARRAY); }
+
+  /// @brief Returns whether this value is a Ruby Hash.
+  [[nodiscard]] bool is_hash() const noexcept { return RB_TYPE_P(raw_, T_HASH); }
+
+private:
+  VALUE raw_ = Qnil;
+};
+
+static_assert(std::is_trivially_copyable_v<value>);
+static_assert(sizeof(value) == sizeof(VALUE));
+
+/// @brief Keeps a temporary Ruby value visible to the conservative GC.
+/// @code rbxx::gc_guard(value); @endcode
+inline void gc_guard(value guarded) noexcept {
+  VALUE raw = guarded.raw();
+  RB_GC_GUARD(raw);
+}
+
+} // namespace rbxx
+// END rbxx/value.hpp
+
+// BEGIN rbxx/object.hpp
+
+
+#include <memory>
+#include <utility>
+
+namespace rbxx {
+namespace detail {
+
+class object_cell {
+public:
+  explicit object_cell(VALUE initial) noexcept : stored_(initial) {
+    rb_gc_register_address(&stored_);
+  }
+
+  object_cell(const object_cell&) = delete;
+  object_cell& operator=(const object_cell&) = delete;
+
+  ~object_cell() noexcept { rb_gc_unregister_address(&stored_); }
+
+  [[nodiscard]] VALUE raw() const noexcept { return stored_; }
+
+private:
+  VALUE stored_;
+};
+
+} // namespace detail
+
+/// @brief A copyable, movable RAII handle that pins a Ruby object across GC and compaction.
+/// @code rbxx::object pinned{rbxx::value{ruby_value}}; @endcode
+class object {
+public:
+  /// @brief Constructs an empty handle representing nil.
+  object() noexcept = default;
+
+  /// @brief Pins the supplied Ruby value.
+  /// @code rbxx::object pinned{rbxx::value{Qtrue}}; @endcode
+  explicit object(value initial) : cell_(std::make_shared<detail::object_cell>(initial.raw())) {}
+
+  /// @brief Pins the supplied raw Ruby VALUE.
+  explicit object(VALUE initial) : object(value{initial}) {}
+
+  object(const object&) noexcept = default;
+  object(object&&) noexcept = default;
+  object& operator=(const object&) noexcept = default;
+  object& operator=(object&&) noexcept = default;
+  ~object() = default;
+
+  /// @brief Returns the pinned object as a non-owning value view.
+  /// @code rbxx::value current = pinned.get(); @endcode
+  [[nodiscard]] value get() const noexcept { return value{raw()}; }
+
+  /// @brief Returns the current raw VALUE, updated after compaction.
+  [[nodiscard]] VALUE raw() const noexcept { return cell_ ? cell_->raw() : Qnil; }
+
+  /// @brief Returns whether the handle is empty or pins nil.
+  [[nodiscard]] bool is_nil() const noexcept { return NIL_P(raw()); }
+
+  /// @brief Releases this handle's ownership of the pin.
+  /// @code pinned.reset(); @endcode
+  void reset() noexcept { cell_.reset(); }
+
+private:
+  std::shared_ptr<detail::object_cell> cell_;
+};
+
+} // namespace rbxx
+// END rbxx/object.hpp
+
+// BEGIN rbxx/exception.hpp
+
+
+#include <exception>
+#include <new>
+#include <stdexcept>
+#include <string>
+
+namespace rbxx {
+
+/// @brief A C++ exception that preserves the original Ruby exception object.
+/// @code catch (const rbxx::ruby_error& error) { error.reraise(); } @endcode
+class ruby_error : public std::exception {
+public:
+  /// @brief Pins a Ruby exception for propagation through C++ frames.
+  explicit ruby_error(value exception) : exception_(exception) {}
+  explicit ruby_error(VALUE exception) : exception_(exception) {}
+
+  /// @brief Returns a stable description for C++ diagnostics.
+  [[nodiscard]] const char* what() const noexcept override { return "Ruby exception"; }
+
+  /// @brief Returns the preserved Ruby exception.
+  [[nodiscard]] value exception() const noexcept { return exception_.get(); }
+
+  /// @brief Returns the Ruby exception class name.
+  [[nodiscard]] std::string ruby_class_name() const;
+
+  /// @brief Returns the Ruby exception message.
+  [[nodiscard]] std::string message() const;
+
+  /// @brief Throws a copy so the outer Ruby boundary can transparently re-raise it.
+  [[noreturn]] void reraise() const { throw *this; }
+
+private:
+  object exception_;
+};
+
+namespace detail {
+
+inline VALUE exception_class_name(VALUE exception) { return rb_class_name(CLASS_OF(exception)); }
+
+inline VALUE exception_message(VALUE exception) {
+  VALUE message = rb_funcall(exception, rb_intern("message"), 0);
+  return rb_obj_as_string(message);
+}
+
+inline std::string protected_exception_string(VALUE exception, VALUE (*function)(VALUE)) {
+  int state = 0;
+  VALUE string = rb_protect(function, exception, &state);
+  if (state != 0) {
+    VALUE nested = rb_errinfo();
+    rb_set_errinfo(Qnil);
+    throw ruby_error(nested);
+  }
+  return std::string(RSTRING_PTR(string), static_cast<std::size_t>(RSTRING_LEN(string)));
+}
+
+struct exception_creation {
+  VALUE klass;
+  const char* message;
+};
+
+inline VALUE create_exception(VALUE opaque) {
+  auto* creation = reinterpret_cast<exception_creation*>(opaque);
+  return rb_exc_new_cstr(creation->klass, creation->message);
+}
+
+inline VALUE make_exception(VALUE klass, const char* message) noexcept {
+  exception_creation creation{klass, message};
+  int state = 0;
+  VALUE result = rb_protect(create_exception, reinterpret_cast<VALUE>(&creation), &state);
+  if (state == 0) {
+    return result;
+  }
+
+  result = rb_errinfo();
+  rb_set_errinfo(Qnil);
+  return result;
+}
+
+/// @brief Converts the active C++ exception into a Ruby exception VALUE without raising it.
+/// @code catch (...) { pending = rbxx::detail::translate_current_exception(); } @endcode
+inline VALUE translate_current_exception() noexcept {
+  try {
+    throw;
+  } catch (const ruby_error& error) {
+    return error.exception().raw();
+  } catch (const std::invalid_argument& error) {
+    return make_exception(rb_eArgError, error.what());
+  } catch (const std::out_of_range& error) {
+    return make_exception(rb_eRangeError, error.what());
+  } catch (const std::range_error& error) {
+    return make_exception(rb_eRangeError, error.what());
+  } catch (const std::bad_alloc& error) {
+    return make_exception(rb_eNoMemError, error.what());
+  } catch (const std::domain_error& error) {
+    return make_exception(rb_eMathDomainError, error.what());
+  } catch (const std::exception& error) {
+    return make_exception(rb_eRuntimeError, error.what());
+  } catch (...) {
+    return make_exception(rb_eRuntimeError, "unknown C++ exception");
+  }
+}
+
+} // namespace detail
+
+inline std::string ruby_error::ruby_class_name() const {
+  return detail::protected_exception_string(exception_.raw(), detail::exception_class_name);
+}
+
+inline std::string ruby_error::message() const {
+  return detail::protected_exception_string(exception_.raw(), detail::exception_message);
+}
+
+} // namespace rbxx
+// END rbxx/exception.hpp
+
+// BEGIN rbxx/extension.hpp
+
+
+#if defined(_WIN32)
+#define RBXX_EXPORT __declspec(dllexport)
+#else
+#define RBXX_EXPORT __attribute__((visibility("default")))
+#endif
+
+#define RBXX_EXTENSION(name)                                                                       \
+  static void rbxx_init_body_##name();                                                             \
+  extern "C" RBXX_EXPORT void Init_##name() {                                                      \
+    VALUE rbxx_pending_exception = Qnil;                                                           \
+    try {                                                                                          \
+      rbxx_init_body_##name();                                                                     \
+      return;                                                                                      \
+    } catch (...) {                                                                                \
+      rbxx_pending_exception = ::rbxx::detail::translate_current_exception();                      \
+    }                                                                                              \
+    rb_exc_raise(rbxx_pending_exception);                                                          \
+  }                                                                                                \
+  static void rbxx_init_body_##name()
+// END rbxx/extension.hpp
+
+// BEGIN rbxx/protect.hpp
+
+
+#include <exception>
+#include <functional>
+#include <optional>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+
+namespace rbxx {
+namespace detail {
+
+template <typename Function, typename... Args> struct protect_payload {
+  using function_type = std::decay_t<Function>;
+  using result_type = std::invoke_result_t<function_type&, std::decay_t<Args>&...>;
+  using stored_result = std::conditional_t<std::is_void_v<result_type>, bool, result_type>;
+
+  function_type function;
+  std::tuple<std::decay_t<Args>...> args;
+  std::optional<stored_result> result;
+  std::exception_ptr cpp_exception;
+};
+
+template <typename Payload> VALUE protect_trampoline(VALUE opaque) noexcept {
+  auto* payload = reinterpret_cast<Payload*>(opaque);
+  try {
+    if constexpr (std::is_void_v<typename Payload::result_type>) {
+      std::apply(payload->function, payload->args);
+      payload->result.emplace(true);
+    } else {
+      payload->result.emplace(std::apply(payload->function, payload->args));
+    }
+  } catch (...) {
+    payload->cpp_exception = std::current_exception();
+  }
+  return Qnil;
+}
+
+} // namespace detail
+
+/// @brief Invokes a Ruby C API operation through rb_protect and converts longjmp to ruby_error.
+/// @code VALUE string = rbxx::protect(rb_utf8_str_new_cstr, "safe"); @endcode
+template <typename Function, typename... Args> auto protect(Function&& function, Args&&... args) {
+  using payload_type = detail::protect_payload<Function, Args...>;
+  static_assert(!std::is_reference_v<typename payload_type::result_type>,
+                "rbxx::protect does not support reference return types");
+
+  payload_type payload{std::forward<Function>(function),
+                       std::tuple<std::decay_t<Args>...>{std::forward<Args>(args)...}, std::nullopt,
+                       nullptr};
+  int state = 0;
+  rb_protect(detail::protect_trampoline<payload_type>, reinterpret_cast<VALUE>(&payload), &state);
+
+  if (state != 0) {
+    VALUE exception = rb_errinfo();
+    rb_set_errinfo(Qnil);
+    throw ruby_error(exception);
+  }
+  if (payload.cpp_exception) {
+    std::rethrow_exception(payload.cpp_exception);
+  }
+
+  if constexpr (std::is_void_v<typename payload_type::result_type>) {
+    return;
+  } else {
+    return std::move(*payload.result);
+  }
+}
+
+} // namespace rbxx
+// END rbxx/protect.hpp
+
 // BEGIN rbxx/version.hpp
 
 #define RBXX_VERSION_MAJOR 0

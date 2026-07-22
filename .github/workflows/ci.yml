@@ -42,6 +42,23 @@ jobs:
       - run: bundle exec rake compile:test test
       - run: bundle exec rake amalgamate:check
 
+  sanitizers:
+    runs-on: ubuntu-latest
+    env:
+      ASAN_OPTIONS: detect_leaks=0
+      CXXFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+      LDFLAGS: -fsanitize=address,undefined
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - name: Run ASAN and UBSAN tests
+        run: |
+          export LD_PRELOAD="$(gcc -print-file-name=libasan.so)"
+          bundle exec rake compile:test test test:gc_stress
+
   lint:
     runs-on: ubuntu-latest
     steps:
