@@ -26,8 +26,8 @@ module Rbxx
       target_name = File.basename(target)
       configure, build = cmake_commands(source_dir, build_dir)
       extension = "#{target_name}.#{RbConfig::CONFIG.fetch('DLEXT')}"
-      makefile = cmake_makefile(configure, build, build_dir, extension,
-                                unexport_make: RUBY_PLATFORM.include?("mingw"))
+      windows = RUBY_PLATFORM.include?("mingw")
+      makefile = cmake_makefile(configure, build, build_dir, extension, windows:)
       File.write("Makefile", makefile)
     end
 
@@ -47,19 +47,39 @@ module Rbxx
       [configure, build]
     end
 
-    def cmake_makefile(configure, build, build_dir, extension, unexport_make: false)
+    def cmake_makefile(configure, build, build_dir, extension, windows: false)
       built_extension = File.join(build_dir, extension)
+      install_copy = if windows
+                       shell_join(["cmake", "-E", "copy", extension,
+                                   "$(sitearchdir)/#{extension}"], windows: true)
+                     else
+                       "cmake -E copy #{Shellwords.escape(extension)} $(sitearchdir)/#{extension}"
+                     end
       lines = [
-        ".PHONY: all clean install", "", "all:", "\t#{Shellwords.join(configure)}",
-        "\t#{Shellwords.join(build)}",
-        "\tcmake -E copy #{Shellwords.escape(built_extension)} #{Shellwords.escape(extension)}", "",
+        ".PHONY: all clean install", "", "all:", "\t#{shell_join(configure, windows:)}",
+        "\t#{shell_join(build, windows:)}",
+        "\t#{shell_join(['cmake', '-E', 'copy', built_extension, extension], windows:)}", "",
         "install: all", "\tcmake -E make_directory $(sitearchdir)",
-        "\tcmake -E copy #{Shellwords.escape(extension)} $(sitearchdir)/#{extension}", "", "clean:",
-        "\tcmake -E remove_directory #{Shellwords.escape(build_dir)}",
-        "\tcmake -E rm -f #{Shellwords.escape(extension)}", ""
+        "\t#{install_copy}", "", "clean:",
+        "\t#{shell_join(['cmake', '-E', 'remove_directory', build_dir], windows:)}",
+        "\t#{shell_join(['cmake', '-E', 'rm', '-f', extension], windows:)}", ""
       ]
-      lines.unshift("unexport MAKE", "") if unexport_make
+      lines.unshift("unexport MAKE", "") if windows
       lines.join("\n")
+    end
+
+    def shell_join(arguments, windows: false)
+      return Shellwords.join(arguments) unless windows
+
+      arguments.map { |argument| windows_shell_escape(argument) }.join(" ")
+    end
+
+    def windows_shell_escape(argument)
+      value = argument.to_s
+      return value if value.match?(%r{\A[A-Za-z0-9_+.,:/\\=@-]+\z})
+
+      escaped = value.gsub(/(\\*)"/) { "#{Regexp.last_match(1) * 2}\\\"" }
+      %("#{escaped.sub(/(\\+)\z/) { |slashes| slashes * 2 }}")
     end
 
     def debug?

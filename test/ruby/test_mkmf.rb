@@ -41,9 +41,12 @@ class MkmfTest < Minitest::Test
                                                  cxx: "g++ -std=gnu++11",
                                                  platform: "x64-mingw-ucrt")
     makefile = Rbxx::Mkmf.cmake_makefile(configure, build, "cmake-build", "demo.so",
-                                         unexport_make: true)
+                                         windows: true)
 
     assert_equal "unexport MAKE", makefile.lines.first.chomp
     assert_equal ["-G", "MinGW Makefiles"], configure.last(2)
+    assert_includes makefile, "-Drbxx_DIR=#{Rbxx::Mkmf.cmake_config_dir}"
+    assert_includes makefile, '"MinGW Makefiles"'
+    refute_includes makefile, "\\="
   end
 end
