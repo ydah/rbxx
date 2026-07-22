@@ -2,7 +2,7 @@
 
 require_relative "rbxx/version"
 
+# Ruby-side tooling for the rbxx C++ binding library.
 module Rbxx
   class Error < StandardError; end
-  # Your code goes here...
 end
