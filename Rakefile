@@ -12,7 +12,6 @@ TEST_BUILD_ROOT = File.join(ROOT, "tmp", "test_extensions")
 TEST_SOURCES = FileList[File.join(ROOT, "test", "cpp", "*.cpp")]
 
 CLEAN.include(TEST_BUILD_ROOT)
-CLOBBER.include(File.join(ROOT, "single_include", "rbxx", "rbxx.hpp"))
 
 namespace :compile do
   desc "Build all native test extensions"
@@ -73,3 +72,39 @@ task :lint do
 end
 
 task default: ["compile:test", :test]
+
+namespace :amalgamate do
+  desc "Generate the rbxx single header"
+  task :generate do
+    sh RbConfig.ruby, File.join(ROOT, "scripts", "amalgamate.rb")
+  end
+
+  desc "Verify that the committed single header is current"
+  task :check do
+    sh RbConfig.ruby, File.join(ROOT, "scripts", "amalgamate.rb"), "--check"
+  end
+
+  desc "Compile an extension using only the generated single header"
+  task smoke: [:generate] do
+    build_dir = File.join(ROOT, "tmp", "amalgamate_smoke")
+    FileUtils.mkdir_p(build_dir)
+    File.write(File.join(build_dir, "single_header_smoke.cpp"), <<~CPP)
+      #include <rbxx/rbxx.hpp>
+      extern "C" void Init_single_header_smoke() {}
+    CPP
+    File.write(File.join(build_dir, "extconf.rb"), <<~RUBY)
+      require "mkmf"
+      $CPPFLAGS = "-I#{File.join(ROOT, 'single_include')} " + $CPPFLAGS
+      $CXXFLAGS = "-std=c++20 " + $CXXFLAGS unless /mswin|msvc/ =~ RUBY_PLATFORM
+      $CXXFLAGS = "/std:c++20 /EHsc /utf-8 " + $CXXFLAGS if /mswin|msvc/ =~ RUBY_PLATFORM
+      create_makefile("single_header_smoke")
+    RUBY
+    Dir.chdir(build_dir) do
+      sh RbConfig.ruby, "extconf.rb" unless File.exist?("Makefile")
+      sh RbConfig::CONFIG.fetch("MAKE", "make")
+    end
+  end
+end
+
+desc "Generate the rbxx single header"
+task amalgamate: "amalgamate:generate"

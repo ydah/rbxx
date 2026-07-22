@@ -28,6 +28,7 @@ jobs:
           ruby-version: ${{ matrix.ruby }}
           bundler-cache: true
       - run: bundle exec rake compile:test test
+      - run: bundle exec rake amalgamate:check amalgamate:smoke
 
   ruby-head:
     runs-on: ubuntu-latest
@@ -39,6 +40,7 @@ jobs:
           ruby-version: head
           bundler-cache: true
       - run: bundle exec rake compile:test test
+      - run: bundle exec rake amalgamate:check
 
   lint:
     runs-on: ubuntu-latest
