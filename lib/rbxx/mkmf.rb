@@ -29,12 +29,24 @@ module Rbxx
       File.write("Makefile", cmake_makefile(configure, build, build_dir, extension))
     end
 
-    def cmake_commands(source_dir, build_dir)
+    def cmake_commands(source_dir, build_dir, cxx: RbConfig::CONFIG.fetch("CXX"),
+                       platform: RUBY_PLATFORM)
+      compiler, *compiler_flags = Shellwords.split(cxx)
+      raise ArgumentError, "rbxx: Ruby C++ compiler is not configured" unless compiler
+
       configure = ["cmake", "-S", File.expand_path(source_dir), "-B", build_dir,
                    "-Drbxx_DIR=#{cmake_config_dir}", "-DRuby_EXECUTABLE=#{RbConfig.ruby}",
-                   "-DCMAKE_CXX_COMPILER=#{RbConfig::CONFIG.fetch('CXX')}"]
-      configure.push("-G", "MinGW Makefiles") if RUBY_PLATFORM.include?("mingw")
+                   "-DCMAKE_CXX_COMPILER=#{compiler}"]
+      configure << "-DCMAKE_CXX_FLAGS_INIT=#{compiler_flags.join(' ')}" unless compiler_flags.empty?
       build = ["cmake", "--build", build_dir, "--config", "Release"]
+
+      if platform.include?("mingw")
+        configure.push("-G", "MinGW Makefiles")
+        clean_environment = ["cmake", "-E", "env", "--unset=MAKE"]
+        configure = clean_environment + configure
+        build = clean_environment + build
+      end
+
       [configure, build]
     end
 

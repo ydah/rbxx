@@ -26,4 +26,24 @@ class MkmfTest < Minitest::Test
     assert_includes flags[:cxxflags], "/EHsc"
     assert_includes flags[:cxxflags], "/utf-8"
   end
+
+  def test_cmake_separates_the_compiler_from_its_flags
+    configure, = Rbxx::Mkmf.cmake_commands("/project/ext", "cmake-build",
+                                           cxx: "clang++ -std=gnu++11",
+                                           platform: "arm64-darwin")
+
+    assert_includes configure, "-DCMAKE_CXX_COMPILER=clang++"
+    assert_includes configure, "-DCMAKE_CXX_FLAGS_INIT=-std=gnu++11"
+  end
+
+  def test_cmake_does_not_pass_the_parent_make_to_mingw_make
+    configure, build = Rbxx::Mkmf.cmake_commands("/project/ext", "cmake-build",
+                                                 cxx: "g++ -std=gnu++11",
+                                                 platform: "x64-mingw-ucrt")
+    clean_environment = ["cmake", "-E", "env", "--unset=MAKE"]
+
+    assert_equal clean_environment, configure.first(clean_environment.length)
+    assert_equal clean_environment, build.first(clean_environment.length)
+    assert_equal ["-G", "MinGW Makefiles"], configure.last(2)
+  end
 end

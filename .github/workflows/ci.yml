@@ -60,7 +60,8 @@ jobs:
       - name: Run ASAN and UBSAN tests
         run: |
           libasan_path="$(gcc -print-file-name=libasan.so)"
-          export LD_PRELOAD="$libasan_path"
+          libstdcxx_path="$(g++ -print-file-name=libstdc++.so.6)"
+          export LD_PRELOAD="${libasan_path}:${libstdcxx_path}"
           bundle exec rake compile:test test test:gc_stress
 
   lint:

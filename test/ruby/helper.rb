@@ -26,16 +26,11 @@ module RbxxTestHelpers
 
   def assert_destructor_runs(counter_class, &)
     before = counter_class.destroyed
-    discard_result(&)
+    # Older Rubies can retain the most recent temporary in a VM stack slot.
+    # Multiple instances ensure that at least one object is truly unreachable.
+    32.times(&)
     5.times { GC.start }
     assert_operator counter_class.destroyed, :>, before
-  end
-
-  private
-
-  def discard_result
-    yield
-    nil
   end
 end
 
