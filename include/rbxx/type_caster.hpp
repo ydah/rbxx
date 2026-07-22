@@ -226,7 +226,7 @@ template <> struct type_caster<object> {
 
 /// @brief Converts a C++ value to Ruby with an actionable missing-caster diagnostic.
 /// @code rbxx::value result = rbxx::to_ruby(42); @endcode
-template <typename T> value to_ruby(T&& input) {
+template <typename T> [[nodiscard]] value to_ruby(T&& input) {
   using converted_type = std::remove_cvref_t<T>;
   static_assert(to_ruby_convertible<converted_type>,
                 "rbxx: type has no type_caster; bind it with def_class<T>() or specialize "
@@ -236,7 +236,7 @@ template <typename T> value to_ruby(T&& input) {
 
 /// @brief Converts a Ruby value to C++ with an actionable missing-caster diagnostic.
 /// @code int result = rbxx::from_ruby<int>(ruby_value); @endcode
-template <typename T> decltype(auto) from_ruby(value input) {
+template <typename T> [[nodiscard]] decltype(auto) from_ruby(value input) {
   using converted_type = std::remove_cvref_t<T>;
   static_assert(from_ruby_convertible<converted_type>,
                 "rbxx: type has no type_caster; bind it with def_class<T>() or specialize "

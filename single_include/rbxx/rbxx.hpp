@@ -584,7 +584,7 @@ template <> struct type_caster<object> {
 
 /// @brief Converts a C++ value to Ruby with an actionable missing-caster diagnostic.
 /// @code rbxx::value result = rbxx::to_ruby(42); @endcode
-template <typename T> value to_ruby(T&& input) {
+template <typename T> [[nodiscard]] value to_ruby(T&& input) {
   using converted_type = std::remove_cvref_t<T>;
   static_assert(to_ruby_convertible<converted_type>,
                 "rbxx: type has no type_caster; bind it with def_class<T>() or specialize "
@@ -594,7 +594,7 @@ template <typename T> value to_ruby(T&& input) {
 
 /// @brief Converts a Ruby value to C++ with an actionable missing-caster diagnostic.
 /// @code int result = rbxx::from_ruby<int>(ruby_value); @endcode
-template <typename T> decltype(auto) from_ruby(value input) {
+template <typename T> [[nodiscard]] decltype(auto) from_ruby(value input) {
   using converted_type = std::remove_cvref_t<T>;
   static_assert(from_ruby_convertible<converted_type>,
                 "rbxx: type has no type_caster; bind it with def_class<T>() or specialize "
@@ -961,17 +961,22 @@ namespace rbxx {
 
 namespace policy {
 
+/// @brief Internal value carried by a public return-value policy constant.
 enum class kind { automatic, copy, take, reference, shared };
 
+/// @brief Selects ownership behavior when converting a C++ return value to Ruby.
 struct return_value_policy {
   kind value;
 };
 
+/// @name Return-value policies
+/// @{
 inline constexpr return_value_policy automatic{kind::automatic};
 inline constexpr return_value_policy copy{kind::copy};
 inline constexpr return_value_policy take{kind::take};
 inline constexpr return_value_policy reference{kind::reference};
 inline constexpr return_value_policy shared{kind::shared};
+/// @}
 
 } // namespace policy
 
@@ -1874,11 +1879,14 @@ void register_static_function(VALUE owner, const char* name, Function&& function
 
 namespace rbxx::op {
 
+/// @brief Metadata for mapping a C++ callable to a Ruby operator method.
 struct name {
   const char* ruby_name;
   bool include_comparable = false;
 };
 
+/// @name Ruby operator names
+/// @{
 inline constexpr name add{"+"};
 inline constexpr name subtract{"-"};
 inline constexpr name multiply{"*"};
@@ -1895,6 +1903,7 @@ inline constexpr name to_s{"to_s"};
 inline constexpr name inspect{"inspect"};
 inline constexpr name hash{"hash"};
 inline constexpr name call{"call"};
+/// @}
 
 } // namespace rbxx::op
 // END rbxx/operators.hpp
@@ -1953,11 +1962,11 @@ private:
 
 /// @brief Defines or reopens a top-level Ruby module.
 /// @code rbxx::module demo = rbxx::define_module("Demo"); @endcode
-inline module define_module(const char* name) {
+[[nodiscard]] inline module define_module(const char* name) {
   return module{value{protect(rb_define_module, name)}};
 }
 
-/// @brief Defines a top-level Ruby global function.
+/// @brief Defines a private Kernel method callable as a Ruby global function.
 /// @code rbxx::define_global_function("native_sum", [](int a, int b) { return a + b; }); @endcode
 template <typename Function, typename... Specs>
 void define_global_function(const char* name, Function&& function, Specs&&... specs) {
@@ -1989,7 +1998,7 @@ namespace rbxx {
 template <typename... Args> struct init_tag {};
 
 /// @brief Creates a constructor signature marker.
-template <typename... Args> constexpr init_tag<Args...> init() noexcept { return {}; }
+template <typename... Args> [[nodiscard]] constexpr init_tag<Args...> init() noexcept { return {}; }
 
 namespace detail {
 
@@ -2420,6 +2429,7 @@ public:
     return *this;
   }
 
+  /// @brief Defines a C++ constructor and optional Ruby argument annotations.
   template <typename... Args, typename... Specs>
     requires((std::is_convertible_v<Specs, argument_spec>) && ...)
   class_& def(init_tag<Args...>, Specs&&... specs) {
@@ -2439,6 +2449,7 @@ public:
     return *this;
   }
 
+  /// @brief Defines an instance method backed by a member pointer or self-first callable.
   template <typename Function, typename... Specs>
     requires((std::is_convertible_v<Specs, argument_spec>) && ...)
   class_& def(const char* name, Function&& function, Specs&&... specs) {
@@ -2491,6 +2502,7 @@ public:
     return result;
   }
 
+  /// @brief Defines a singleton method on the bound Ruby class.
   template <typename Function, typename... Specs>
   class_& def_static(const char* name, Function&& function, Specs&&... specs) {
     detail::register_static_function(ruby_class_.raw(), name, std::forward<Function>(function),
@@ -2498,10 +2510,12 @@ public:
     return *this;
   }
 
+  /// @brief Defines a Ruby reader for a public C++ data member.
   template <typename Member> class_& def_attr_reader(const char* name, Member T::* member) {
     return def(name, [member](const T& self) -> const Member& { return self.*member; });
   }
 
+  /// @brief Defines a Ruby writer for a public C++ data member.
   template <typename Member> class_& def_attr_writer(const char* name, Member T::* member) {
     std::string writer = std::string(name) + "=";
     return def(writer.c_str(), [member](T& self, Member updated) {
@@ -2510,12 +2524,13 @@ public:
     });
   }
 
+  /// @brief Defines Ruby reader and writer methods for a public C++ data member.
   template <typename Member> class_& def_attr_accessor(const char* name, Member T::* member) {
     def_attr_reader(name, member);
     return def_attr_writer(name, member);
   }
 
-  /// @brief Defines #each, includes Enumerable, and returns sized enumerators without a block.
+  /// @brief Defines Ruby each, includes Enumerable, and returns sized enumerators without a block.
   template <auto Begin, auto End> class_& def_iterable() {
     using item_reference = decltype(*std::invoke(Begin, std::declval<T&>()));
     static_assert(to_ruby_convertible<item_reference>,
@@ -2739,7 +2754,7 @@ using nogvl_adapter =
 } // namespace detail
 
 /// @brief Wraps a pure C++ callable so its execution occurs without the Ruby GVL.
-template <typename Function> auto nogvl(Function&& function) {
+template <typename Function> [[nodiscard]] auto nogvl(Function&& function) {
   using stored_function = std::decay_t<Function>;
   static_assert(detail::function_signature<stored_function>,
                 "rbxx: nogvl requires a callable with a concrete signature");
@@ -2750,7 +2765,7 @@ template <typename Function> auto nogvl(Function&& function) {
 
 /// @brief Wraps a pure C++ callable with a noexcept interruption hook.
 template <typename Function, typename Unblock>
-auto nogvl_interruptible(Function&& function, Unblock&& unblock) {
+[[nodiscard]] auto nogvl_interruptible(Function&& function, Unblock&& unblock) {
   using stored_function = std::decay_t<Function>;
   using stored_unblock = std::decay_t<Unblock>;
   static_assert(detail::function_signature<stored_function>,

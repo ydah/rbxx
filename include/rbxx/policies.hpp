@@ -6,17 +6,22 @@ namespace rbxx {
 
 namespace policy {
 
+/// @brief Internal value carried by a public return-value policy constant.
 enum class kind { automatic, copy, take, reference, shared };
 
+/// @brief Selects ownership behavior when converting a C++ return value to Ruby.
 struct return_value_policy {
   kind value;
 };
 
+/// @name Return-value policies
+/// @{
 inline constexpr return_value_policy automatic{kind::automatic};
 inline constexpr return_value_policy copy{kind::copy};
 inline constexpr return_value_policy take{kind::take};
 inline constexpr return_value_policy reference{kind::reference};
 inline constexpr return_value_policy shared{kind::shared};
+/// @}
 
 } // namespace policy
 

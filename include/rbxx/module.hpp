@@ -54,11 +54,11 @@ private:
 
 /// @brief Defines or reopens a top-level Ruby module.
 /// @code rbxx::module demo = rbxx::define_module("Demo"); @endcode
-inline module define_module(const char* name) {
+[[nodiscard]] inline module define_module(const char* name) {
   return module{value{protect(rb_define_module, name)}};
 }
 
-/// @brief Defines a top-level Ruby global function.
+/// @brief Defines a private Kernel method callable as a Ruby global function.
 /// @code rbxx::define_global_function("native_sum", [](int a, int b) { return a + b; }); @endcode
 template <typename Function, typename... Specs>
 void define_global_function(const char* name, Function&& function, Specs&&... specs) {

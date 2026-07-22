@@ -2,11 +2,14 @@
 
 namespace rbxx::op {
 
+/// @brief Metadata for mapping a C++ callable to a Ruby operator method.
 struct name {
   const char* ruby_name;
   bool include_comparable = false;
 };
 
+/// @name Ruby operator names
+/// @{
 inline constexpr name add{"+"};
 inline constexpr name subtract{"-"};
 inline constexpr name multiply{"*"};
@@ -23,5 +26,6 @@ inline constexpr name to_s{"to_s"};
 inline constexpr name inspect{"inspect"};
 inline constexpr name hash{"hash"};
 inline constexpr name call{"call"};
+/// @}
 
 } // namespace rbxx::op

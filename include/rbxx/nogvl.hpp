@@ -121,7 +121,7 @@ using nogvl_adapter =
 } // namespace detail
 
 /// @brief Wraps a pure C++ callable so its execution occurs without the Ruby GVL.
-template <typename Function> auto nogvl(Function&& function) {
+template <typename Function> [[nodiscard]] auto nogvl(Function&& function) {
   using stored_function = std::decay_t<Function>;
   static_assert(detail::function_signature<stored_function>,
                 "rbxx: nogvl requires a callable with a concrete signature");
@@ -132,7 +132,7 @@ template <typename Function> auto nogvl(Function&& function) {
 
 /// @brief Wraps a pure C++ callable with a noexcept interruption hook.
 template <typename Function, typename Unblock>
-auto nogvl_interruptible(Function&& function, Unblock&& unblock) {
+[[nodiscard]] auto nogvl_interruptible(Function&& function, Unblock&& unblock) {
   using stored_function = std::decay_t<Function>;
   using stored_unblock = std::decay_t<Unblock>;
   static_assert(detail::function_signature<stored_function>,

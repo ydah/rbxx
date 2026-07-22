@@ -167,3 +167,37 @@ namespace :bench do
     puts format("representative binding syntax check: %.3f s", elapsed)
   end
 end
+
+desc "Build the public C++ API reference"
+task :docs do
+  sh "doxygen", File.join(ROOT, "Doxyfile")
+end
+
+namespace :examples do
+  desc "Build and execute all four example projects"
+  task :smoke do
+    %w[class-binding callback].each do |name|
+      directory = File.join(ROOT, "examples", name)
+      Dir.chdir(directory) do
+        sh RbConfig.ruby, "extconf.rb"
+        sh RbConfig::CONFIG.fetch("MAKE", "make")
+        sh RbConfig.ruby, "run.rb"
+      end
+    end
+
+    cmake_build = File.join(ROOT, "tmp", "cmake-example")
+    sh "cmake", "-S", File.join(ROOT, "examples", "cmake-demo"), "-B", cmake_build
+    sh "cmake", "--build", cmake_build
+    sh RbConfig.ruby, "-I#{cmake_build}", "-rcmake_demo", "-e",
+       "abort unless CmakeDemo.square(9) == 81 && !CmakeDemo.zlib_version.empty?"
+
+    project = File.join(ROOT, "examples", "precompiled-gem")
+    extension = File.join(project, "ext", "precompiled_demo")
+    Dir.chdir(extension) do
+      sh RbConfig.ruby, "-I#{File.join(ROOT, 'lib')}", "extconf.rb"
+      sh RbConfig::CONFIG.fetch("MAKE", "make")
+    end
+    sh RbConfig.ruby, "-I#{extension}", "-rprecompiled_demo", "-e",
+       "abort unless PrecompiledDemo.multiply(6, 7) == 42"
+  end
+end

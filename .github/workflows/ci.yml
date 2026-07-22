@@ -16,6 +16,8 @@ jobs:
       matrix:
         include:
           - { name: Linux, os: ubuntu-latest, ruby: "3.1" }
+          - { name: Linux, os: ubuntu-latest, ruby: "3.2" }
+          - { name: Linux, os: ubuntu-latest, ruby: "3.3" }
           - { name: Linux, os: ubuntu-latest, ruby: "3.4" }
           - { name: macOS, os: macos-latest, ruby: "3.4" }
           - { name: x64-mingw-ucrt, os: windows-latest, ruby: "3.4" }
@@ -79,10 +81,42 @@ jobs:
         with:
           ruby-version: "3.4"
           bundler-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y clangd doxygen zlib1g-dev
       - run: bundle exec rake precompiled:dry_run
-      - run: cmake -S examples/cmake-demo -B tmp/cmake-demo
+      - run: cmake -S examples/cmake-demo -B tmp/cmake-demo -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
       - run: cmake --build tmp/cmake-demo
+      - run: clangd --check=examples/cmake-demo/cmake_demo.cpp --compile-commands-dir=tmp/cmake-demo
+      - run: bundle exec rake bench:run
       - run: bundle exec rake bench:compile_time
+      - run: bundle exec rake docs examples:smoke
+
+  clang:
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - run: bundle exec rake compile:test test
+
+  msvc-headers:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - uses: ilammy/msvc-dev-cmd@v1
+      - shell: pwsh
+        run: |
+          $rubyHeader = ruby -rrbconfig -e "print RbConfig::CONFIG['rubyhdrdir']"
+          $rubyArchHeader = ruby -rrbconfig -e "print RbConfig::CONFIG['rubyarchhdrdir']"
+          cl /nologo /std:c++20 /EHsc /utf-8 /Iinclude /I"$rubyHeader" /I"$rubyArchHeader" /Zs test/cpp/smoke.cpp
 
   precompiled-linux:
     runs-on: ubuntu-latest

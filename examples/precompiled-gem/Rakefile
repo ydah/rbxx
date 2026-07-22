@@ -1,0 +1,23 @@
+# frozen_string_literal: true
+
+require "rake/extensiontask"
+require "rake/testtask"
+require "rbxx/rake_tasks"
+
+spec = Gem::Specification.load("precompiled_demo.gemspec")
+Rake::ExtensionTask.new("precompiled_demo", spec) do |ext|
+  ext.ext_dir = "ext/precompiled_demo"
+  ext.lib_dir = "lib/precompiled_demo"
+  ext.cross_compile = true
+  ext.cross_platform = Rbxx::RakeTasks::PLATFORMS
+end
+
+Rbxx::RakeTasks.install
+
+Rake::TestTask.new(:test) do |test|
+  test.libs << "lib"
+  test.pattern = "test/test_*.rb"
+end
+
+Rake::Task[:test].enhance([:compile])
+task default: :test

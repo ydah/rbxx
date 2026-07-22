@@ -20,7 +20,7 @@ namespace rbxx {
 template <typename... Args> struct init_tag {};
 
 /// @brief Creates a constructor signature marker.
-template <typename... Args> constexpr init_tag<Args...> init() noexcept { return {}; }
+template <typename... Args> [[nodiscard]] constexpr init_tag<Args...> init() noexcept { return {}; }
 
 namespace detail {
 
@@ -451,6 +451,7 @@ public:
     return *this;
   }
 
+  /// @brief Defines a C++ constructor and optional Ruby argument annotations.
   template <typename... Args, typename... Specs>
     requires((std::is_convertible_v<Specs, argument_spec>) && ...)
   class_& def(init_tag<Args...>, Specs&&... specs) {
@@ -470,6 +471,7 @@ public:
     return *this;
   }
 
+  /// @brief Defines an instance method backed by a member pointer or self-first callable.
   template <typename Function, typename... Specs>
     requires((std::is_convertible_v<Specs, argument_spec>) && ...)
   class_& def(const char* name, Function&& function, Specs&&... specs) {
@@ -522,6 +524,7 @@ public:
     return result;
   }
 
+  /// @brief Defines a singleton method on the bound Ruby class.
   template <typename Function, typename... Specs>
   class_& def_static(const char* name, Function&& function, Specs&&... specs) {
     detail::register_static_function(ruby_class_.raw(), name, std::forward<Function>(function),
@@ -529,10 +532,12 @@ public:
     return *this;
   }
 
+  /// @brief Defines a Ruby reader for a public C++ data member.
   template <typename Member> class_& def_attr_reader(const char* name, Member T::* member) {
     return def(name, [member](const T& self) -> const Member& { return self.*member; });
   }
 
+  /// @brief Defines a Ruby writer for a public C++ data member.
   template <typename Member> class_& def_attr_writer(const char* name, Member T::* member) {
     std::string writer = std::string(name) + "=";
     return def(writer.c_str(), [member](T& self, Member updated) {
@@ -541,6 +546,7 @@ public:
     });
   }
 
+  /// @brief Defines Ruby reader and writer methods for a public C++ data member.
   template <typename Member> class_& def_attr_accessor(const char* name, Member T::* member) {
     def_attr_reader(name, member);
     return def_attr_writer(name, member);
