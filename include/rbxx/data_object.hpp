@@ -48,9 +48,9 @@ private:
 
 namespace detail {
 
-template <typename T> struct is_ownership_pointer : std::false_type {};
-template <typename T> struct is_ownership_pointer<std::unique_ptr<T>> : std::true_type {};
-template <typename T> struct is_ownership_pointer<std::shared_ptr<T>> : std::true_type {};
+template <typename T> struct is_non_bindable_class : std::false_type {};
+template <typename T> struct is_non_bindable_class<std::unique_ptr<T>> : std::true_type {};
+template <typename T> struct is_non_bindable_class<std::shared_ptr<T>> : std::true_type {};
 
 enum class ownership { owned, borrowed, shared };
 
@@ -184,7 +184,7 @@ template <typename T> data_wrapper<T>& exact_wrapper(value self) {
 
 template <typename T>
 struct type_caster<T, std::enable_if_t<std::is_class_v<T> && !std::is_same_v<T, object> &&
-                                       !detail::is_ownership_pointer<T>::value>> {
+                                       !detail::is_non_bindable_class<T>::value>> {
   static constexpr std::string_view name = "bound C++ object";
   static T& load(value input) { return detail::load_registered<T>(input); }
   static value dump(const T& input) { return detail::wrap_copy(input); }

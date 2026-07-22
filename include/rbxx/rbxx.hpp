@@ -10,6 +10,7 @@
 #include <rbxx/policies.hpp>
 #include <rbxx/protect.hpp>
 #include <rbxx/registry.hpp>
+#include <rbxx/stl.hpp>
 #include <rbxx/type_caster.hpp>
 #include <rbxx/value.hpp>
 #include <rbxx/version.hpp>

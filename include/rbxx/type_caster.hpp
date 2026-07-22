@@ -76,8 +76,14 @@ template <typename Integer> Integer load_integer(value input) {
 
 template <typename Integer> value dump_integer(Integer input) {
   if constexpr (std::is_signed_v<Integer>) {
+    if (RB_FIXABLE(static_cast<LONG_LONG>(input))) {
+      return value{LONG2FIX(static_cast<long>(input))};
+    }
     return value{protect(rb_ll2inum, static_cast<LONG_LONG>(input))};
   } else {
+    if (RB_POSFIXABLE(static_cast<unsigned LONG_LONG>(input))) {
+      return value{LONG2FIX(static_cast<long>(input))};
+    }
     return value{protect(rb_ull2inum, static_cast<unsigned LONG_LONG>(input))};
   }
 }
@@ -91,6 +97,14 @@ inline const char* checked_string_pointer(value input) {
     VALUE string = raw;
     return StringValueCStr(string);
   });
+}
+
+inline VALUE checked_string_value(value input) {
+  VALUE converted = protect(rb_check_string_type, input.raw());
+  if (NIL_P(converted)) {
+    throw_type_error("String or object responding to #to_str", input);
+  }
+  return converted;
 }
 
 inline value dump_utf8(const char* bytes, std::size_t size) {
@@ -161,7 +175,12 @@ template <> struct type_caster<const char*> {
 template <> struct type_caster<std::string> {
   static constexpr std::string_view name = "String";
   static std::string load(value input) {
-    return std::string(detail::checked_string_pointer(input));
+    VALUE converted = detail::checked_string_value(input);
+    const char* bytes = protect([converted]() mutable {
+      VALUE string = converted;
+      return StringValueCStr(string);
+    });
+    return std::string(bytes, static_cast<std::size_t>(RSTRING_LEN(converted)));
   }
   static value dump(const std::string& input) {
     return detail::dump_utf8(input.data(), input.size());

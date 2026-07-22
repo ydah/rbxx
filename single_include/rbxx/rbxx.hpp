@@ -457,8 +457,14 @@ template <typename Integer> Integer load_integer(value input) {
 
 template <typename Integer> value dump_integer(Integer input) {
   if constexpr (std::is_signed_v<Integer>) {
+    if (RB_FIXABLE(static_cast<LONG_LONG>(input))) {
+      return value{LONG2FIX(static_cast<long>(input))};
+    }
     return value{protect(rb_ll2inum, static_cast<LONG_LONG>(input))};
   } else {
+    if (RB_POSFIXABLE(static_cast<unsigned LONG_LONG>(input))) {
+      return value{LONG2FIX(static_cast<long>(input))};
+    }
     return value{protect(rb_ull2inum, static_cast<unsigned LONG_LONG>(input))};
   }
 }
@@ -472,6 +478,14 @@ inline const char* checked_string_pointer(value input) {
     VALUE string = raw;
     return StringValueCStr(string);
   });
+}
+
+inline VALUE checked_string_value(value input) {
+  VALUE converted = protect(rb_check_string_type, input.raw());
+  if (NIL_P(converted)) {
+    throw_type_error("String or object responding to #to_str", input);
+  }
+  return converted;
 }
 
 inline value dump_utf8(const char* bytes, std::size_t size) {
@@ -542,7 +556,12 @@ template <> struct type_caster<const char*> {
 template <> struct type_caster<std::string> {
   static constexpr std::string_view name = "String";
   static std::string load(value input) {
-    return std::string(detail::checked_string_pointer(input));
+    VALUE converted = detail::checked_string_value(input);
+    const char* bytes = protect([converted]() mutable {
+      VALUE string = converted;
+      return StringValueCStr(string);
+    });
+    return std::string(bytes, static_cast<std::size_t>(RSTRING_LEN(converted)));
   }
   static value dump(const std::string& input) {
     return detail::dump_utf8(input.data(), input.size());
@@ -784,9 +803,9 @@ private:
 
 namespace detail {
 
-template <typename T> struct is_ownership_pointer : std::false_type {};
-template <typename T> struct is_ownership_pointer<std::unique_ptr<T>> : std::true_type {};
-template <typename T> struct is_ownership_pointer<std::shared_ptr<T>> : std::true_type {};
+template <typename T> struct is_non_bindable_class : std::false_type {};
+template <typename T> struct is_non_bindable_class<std::unique_ptr<T>> : std::true_type {};
+template <typename T> struct is_non_bindable_class<std::shared_ptr<T>> : std::true_type {};
 
 enum class ownership { owned, borrowed, shared };
 
@@ -920,7 +939,7 @@ template <typename T> data_wrapper<T>& exact_wrapper(value self) {
 
 template <typename T>
 struct type_caster<T, std::enable_if_t<std::is_class_v<T> && !std::is_same_v<T, object> &&
-                                       !detail::is_ownership_pointer<T>::value>> {
+                                       !detail::is_non_bindable_class<T>::value>> {
   static constexpr std::string_view name = "bound C++ object";
   static T& load(value input) { return detail::load_registered<T>(input); }
   static value dump(const T& input) { return detail::wrap_copy(input); }
@@ -1643,6 +1662,406 @@ class_<T> module::def_class(const char* name, std::source_location location) {
   }                                                                                                \
   static void rbxx_init_body_##name()
 // END rbxx/extension.hpp
+
+// BEGIN rbxx/stl/detail.hpp
+
+
+#include <limits>
+#include <string>
+
+namespace rbxx::detail {
+
+inline VALUE coerce_array(value input) {
+  VALUE converted = protect(rb_check_array_type, input.raw());
+  if (NIL_P(converted)) {
+    throw_type_error("Array or object responding to #to_ary", input);
+  }
+  return converted;
+}
+
+inline VALUE coerce_hash(value input) {
+  VALUE converted = protect(rb_check_hash_type, input.raw());
+  if (NIL_P(converted)) {
+    throw_type_error("Hash or object responding to #to_hash", input);
+  }
+  return converted;
+}
+
+template <typename Range> value dump_array_range(const Range& input) {
+  const auto size = input.size();
+  if (size > static_cast<std::size_t>(std::numeric_limits<long>::max())) {
+    throw std::length_error("rbxx: container is too large for a Ruby Array");
+  }
+  return value{protect([&input, size] {
+    VALUE result = rb_ary_new_capa(static_cast<long>(size));
+    for (const auto& element : input) {
+      rb_ary_push(result, to_ruby(element).raw());
+    }
+    return result;
+  })};
+}
+
+template <typename Map> value dump_hash_range(const Map& input) {
+  return value{protect([&input] {
+    VALUE result = rb_hash_new();
+    for (const auto& [key, mapped] : input) {
+      rb_hash_aset(result, to_ruby(key).raw(), to_ruby(mapped).raw());
+    }
+    return result;
+  })};
+}
+
+inline VALUE hash_pairs(VALUE hash) {
+  return protect([hash] { return rb_funcall(hash, rb_intern("to_a"), 0); });
+}
+
+} // namespace rbxx::detail
+// END rbxx/stl/detail.hpp
+
+// BEGIN rbxx/stl/array.hpp
+
+
+#include <array>
+#include <sstream>
+
+namespace rbxx {
+namespace detail {
+template <typename T, std::size_t Size>
+struct is_non_bindable_class<std::array<T, Size>> : std::true_type {};
+} // namespace detail
+
+template <typename T, std::size_t Size> struct type_caster<std::array<T, Size>> {
+  static constexpr std::string_view name = "Array";
+
+  static std::array<T, Size> load(value input) {
+    VALUE array = detail::coerce_array(input);
+    if (RARRAY_LEN(array) != static_cast<long>(Size)) {
+      std::ostringstream message;
+      message << "rbxx: expected Array of length " << Size << ", got " << RARRAY_LEN(array);
+      throw ruby_error(detail::make_exception(rb_eArgError, message.str().c_str()));
+    }
+    return load_elements(array, std::make_index_sequence<Size>{});
+  }
+
+  static value dump(const std::array<T, Size>& input) { return detail::dump_array_range(input); }
+
+  static bool matches(value input) noexcept {
+    return input.is_array() && RARRAY_LEN(input.raw()) == static_cast<long>(Size);
+  }
+
+private:
+  template <std::size_t... Index>
+  static std::array<T, Size> load_elements(VALUE array, std::index_sequence<Index...>) {
+    return {from_ruby<T>(value{RARRAY_AREF(array, static_cast<long>(Index))})...};
+  }
+};
+
+} // namespace rbxx
+// END rbxx/stl/array.hpp
+
+// BEGIN rbxx/stl/chrono.hpp
+
+
+#include <chrono>
+
+namespace rbxx {
+namespace detail {
+template <typename Rep, typename Period>
+struct is_non_bindable_class<std::chrono::duration<Rep, Period>> : std::true_type {};
+} // namespace detail
+
+template <typename Rep, typename Period> struct type_caster<std::chrono::duration<Rep, Period>> {
+  using duration_type = std::chrono::duration<Rep, Period>;
+  static constexpr std::string_view name = "seconds";
+  static duration_type load(value input) {
+    const auto seconds = std::chrono::duration<double>{from_ruby<double>(input)};
+    return std::chrono::duration_cast<duration_type>(seconds);
+  }
+  static value dump(const duration_type& input) {
+    return to_ruby(std::chrono::duration<double>(input).count());
+  }
+  static bool matches(value input) noexcept { return type_caster<double>::matches(input); }
+};
+
+} // namespace rbxx
+// END rbxx/stl/chrono.hpp
+
+// BEGIN rbxx/stl/filesystem.hpp
+
+
+#include <filesystem>
+
+namespace rbxx {
+namespace detail {
+template <> struct is_non_bindable_class<std::filesystem::path> : std::true_type {};
+} // namespace detail
+
+template <> struct type_caster<std::filesystem::path> {
+  static constexpr std::string_view name = "String path";
+  static std::filesystem::path load(value input) {
+    return std::filesystem::path{from_ruby<std::string>(input)};
+  }
+  static value dump(const std::filesystem::path& input) { return to_ruby(input.string()); }
+  static bool matches(value input) noexcept { return type_caster<std::string>::matches(input); }
+};
+
+} // namespace rbxx
+// END rbxx/stl/filesystem.hpp
+
+// BEGIN rbxx/stl/map.hpp
+
+
+#include <map>
+#include <unordered_map>
+
+namespace rbxx {
+namespace detail {
+template <typename Key, typename Mapped, typename Compare, typename Allocator>
+struct is_non_bindable_class<std::map<Key, Mapped, Compare, Allocator>> : std::true_type {};
+template <typename Key, typename Mapped, typename Hash, typename Equal, typename Allocator>
+struct is_non_bindable_class<std::unordered_map<Key, Mapped, Hash, Equal, Allocator>>
+    : std::true_type {};
+
+template <typename Map> Map load_map(value input) {
+  VALUE pairs = hash_pairs(coerce_hash(input));
+  Map result;
+  const long length = RARRAY_LEN(pairs);
+  for (long index = 0; index < length; ++index) {
+    VALUE pair = RARRAY_AREF(pairs, index);
+    using key_type = typename Map::key_type;
+    using mapped_type = typename Map::mapped_type;
+    result.emplace(from_ruby<key_type>(value{RARRAY_AREF(pair, 0)}),
+                   from_ruby<mapped_type>(value{RARRAY_AREF(pair, 1)}));
+  }
+  return result;
+}
+} // namespace detail
+
+template <typename Key, typename Mapped, typename Compare, typename Allocator>
+struct type_caster<std::map<Key, Mapped, Compare, Allocator>> {
+  using map_type = std::map<Key, Mapped, Compare, Allocator>;
+  static constexpr std::string_view name = "Hash";
+  static map_type load(value input) { return detail::load_map<map_type>(input); }
+  static value dump(const map_type& input) { return detail::dump_hash_range(input); }
+  static bool matches(value input) noexcept { return input.is_hash(); }
+};
+
+template <typename Key, typename Mapped, typename Hash, typename Equal, typename Allocator>
+struct type_caster<std::unordered_map<Key, Mapped, Hash, Equal, Allocator>> {
+  using map_type = std::unordered_map<Key, Mapped, Hash, Equal, Allocator>;
+  static constexpr std::string_view name = "Hash";
+  static map_type load(value input) { return detail::load_map<map_type>(input); }
+  static value dump(const map_type& input) { return detail::dump_hash_range(input); }
+  static bool matches(value input) noexcept { return input.is_hash(); }
+};
+
+} // namespace rbxx
+// END rbxx/stl/map.hpp
+
+// BEGIN rbxx/stl/optional.hpp
+
+
+#include <optional>
+
+namespace rbxx {
+namespace detail {
+template <typename T> struct is_non_bindable_class<std::optional<T>> : std::true_type {};
+} // namespace detail
+
+template <typename T> struct type_caster<std::optional<T>> {
+  static constexpr std::string_view name = "Object or nil";
+  static std::optional<T> load(value input) {
+    return input.is_nil() ? std::nullopt : std::optional<T>{from_ruby<T>(input)};
+  }
+  static value dump(const std::optional<T>& input) { return input ? to_ruby(*input) : value{Qnil}; }
+  static bool matches(value input) noexcept {
+    return input.is_nil() || type_caster<T>::matches(input);
+  }
+};
+
+} // namespace rbxx
+// END rbxx/stl/optional.hpp
+
+// BEGIN rbxx/stl/set.hpp
+
+
+#include <set>
+
+namespace rbxx {
+namespace detail {
+template <typename T, typename Compare, typename Allocator>
+struct is_non_bindable_class<std::set<T, Compare, Allocator>> : std::true_type {};
+} // namespace detail
+
+template <typename T, typename Compare, typename Allocator>
+struct type_caster<std::set<T, Compare, Allocator>> {
+  using set_type = std::set<T, Compare, Allocator>;
+  static constexpr std::string_view name = "Array";
+  static set_type load(value input) {
+    VALUE array = detail::coerce_array(input);
+    set_type result;
+    const long length = RARRAY_LEN(array);
+    for (long index = 0; index < length; ++index) {
+      result.insert(from_ruby<T>(value{RARRAY_AREF(array, index)}));
+    }
+    return result;
+  }
+  static value dump(const set_type& input) { return detail::dump_array_range(input); }
+  static bool matches(value input) noexcept { return input.is_array(); }
+};
+
+} // namespace rbxx
+// END rbxx/stl/set.hpp
+
+// BEGIN rbxx/stl/tuple.hpp
+
+
+#include <tuple>
+#include <utility>
+
+namespace rbxx {
+namespace detail {
+template <typename First, typename Second>
+struct is_non_bindable_class<std::pair<First, Second>> : std::true_type {};
+template <typename... Items> struct is_non_bindable_class<std::tuple<Items...>> : std::true_type {};
+
+inline void require_tuple_length(VALUE array, long expected) {
+  if (RARRAY_LEN(array) == expected) {
+    return;
+  }
+  std::string message = "rbxx: expected Array tuple of length ";
+  message += std::to_string(expected);
+  message += ", got ";
+  message += std::to_string(RARRAY_LEN(array));
+  throw ruby_error(make_exception(rb_eArgError, message.c_str()));
+}
+
+template <typename Tuple, std::size_t... Index>
+Tuple load_tuple(VALUE array, std::index_sequence<Index...>) {
+  return Tuple{from_ruby<std::tuple_element_t<Index, Tuple>>(
+      value{RARRAY_AREF(array, static_cast<long>(Index))})...};
+}
+
+template <typename Tuple, std::size_t... Index>
+value dump_tuple(const Tuple& input, std::index_sequence<Index...>) {
+  return value{protect([&input] {
+    VALUE result = rb_ary_new_capa(static_cast<long>(sizeof...(Index)));
+    (rb_ary_push(result, to_ruby(std::get<Index>(input)).raw()), ...);
+    return result;
+  })};
+}
+} // namespace detail
+
+template <typename First, typename Second> struct type_caster<std::pair<First, Second>> {
+  using pair_type = std::pair<First, Second>;
+  static constexpr std::string_view name = "Array(2)";
+  static pair_type load(value input) {
+    VALUE array = detail::coerce_array(input);
+    detail::require_tuple_length(array, 2);
+    return {from_ruby<First>(value{RARRAY_AREF(array, 0)}),
+            from_ruby<Second>(value{RARRAY_AREF(array, 1)})};
+  }
+  static value dump(const pair_type& input) {
+    return detail::dump_tuple(input, std::index_sequence<0, 1>{});
+  }
+  static bool matches(value input) noexcept {
+    return input.is_array() && RARRAY_LEN(input.raw()) == 2;
+  }
+};
+
+template <typename... Items> struct type_caster<std::tuple<Items...>> {
+  using tuple_type = std::tuple<Items...>;
+  static constexpr std::string_view name = "Array tuple";
+  static tuple_type load(value input) {
+    VALUE array = detail::coerce_array(input);
+    detail::require_tuple_length(array, static_cast<long>(sizeof...(Items)));
+    return detail::load_tuple<tuple_type>(array, std::index_sequence_for<Items...>{});
+  }
+  static value dump(const tuple_type& input) {
+    return detail::dump_tuple(input, std::index_sequence_for<Items...>{});
+  }
+  static bool matches(value input) noexcept {
+    return input.is_array() && RARRAY_LEN(input.raw()) == static_cast<long>(sizeof...(Items));
+  }
+};
+
+} // namespace rbxx
+// END rbxx/stl/tuple.hpp
+
+// BEGIN rbxx/stl/variant.hpp
+
+
+#include <variant>
+
+namespace rbxx {
+namespace detail {
+template <typename... Items>
+struct is_non_bindable_class<std::variant<Items...>> : std::true_type {};
+
+template <typename Variant, std::size_t Index = 0> Variant load_variant(value input) {
+  if constexpr (Index == std::variant_size_v<Variant>) {
+    throw_type_error("one of the std::variant alternatives", input);
+  } else {
+    using alternative = std::variant_alternative_t<Index, Variant>;
+    if (type_caster<alternative>::matches(input)) {
+      return Variant{std::in_place_index<Index>, from_ruby<alternative>(input)};
+    }
+    return load_variant<Variant, Index + 1U>(input);
+  }
+}
+} // namespace detail
+
+template <typename... Items> struct type_caster<std::variant<Items...>> {
+  using variant_type = std::variant<Items...>;
+  static constexpr std::string_view name = "variant";
+  static variant_type load(value input) { return detail::load_variant<variant_type>(input); }
+  static value dump(const variant_type& input) {
+    return std::visit([](const auto& selected) { return to_ruby(selected); }, input);
+  }
+  static bool matches(value input) noexcept { return (type_caster<Items>::matches(input) || ...); }
+};
+
+} // namespace rbxx
+// END rbxx/stl/variant.hpp
+
+// BEGIN rbxx/stl/vector.hpp
+
+
+#include <vector>
+
+namespace rbxx {
+namespace detail {
+template <typename T, typename Allocator>
+struct is_non_bindable_class<std::vector<T, Allocator>> : std::true_type {};
+} // namespace detail
+
+template <typename T, typename Allocator> struct type_caster<std::vector<T, Allocator>> {
+  static constexpr std::string_view name = "Array";
+
+  static std::vector<T, Allocator> load(value input) {
+    VALUE array = detail::coerce_array(input);
+    const auto length = RARRAY_LEN(array);
+    std::vector<T, Allocator> result;
+    result.reserve(static_cast<std::size_t>(length));
+    for (long index = 0; index < length; ++index) {
+      result.push_back(from_ruby<T>(value{RARRAY_AREF(array, index)}));
+    }
+    return result;
+  }
+
+  static value dump(const std::vector<T, Allocator>& input) {
+    return detail::dump_array_range(input);
+  }
+
+  static bool matches(value input) noexcept { return input.is_array(); }
+};
+
+} // namespace rbxx
+// END rbxx/stl/vector.hpp
+
+// BEGIN rbxx/stl.hpp
+
+// END rbxx/stl.hpp
 
 // BEGIN rbxx/version.hpp
 
