@@ -2,9 +2,12 @@
 
 #include <rbxx/function.hpp>
 
+#include <source_location>
 #include <utility>
 
 namespace rbxx {
+
+template <typename T> class class_;
 
 /// @brief A non-owning DSL handle for a Ruby Module.
 /// @code rbxx::define_module("Demo").def("answer", [] { return 42; }); @endcode
@@ -22,6 +25,12 @@ public:
     detail::register_function(wrapped_.raw(), name, std::forward<Function>(function));
     return *this;
   }
+
+  /// @brief Defines a Ruby class backed by CRuby TypedData.
+  /// @code auto counter = mod.def_class<Counter>("Counter"); @endcode
+  template <typename T, typename Base = void>
+  class_<T> def_class(const char* name,
+                      std::source_location location = std::source_location::current());
 
 private:
   value wrapped_;

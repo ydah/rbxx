@@ -1,7 +1,7 @@
 // EXPECT: rbxx: function argument type has no type_caster
 #include <rbxx/rbxx.hpp>
 
-struct unbound_argument {};
+enum class unbound_argument { value };
 
 void consume(unbound_argument) {}
 

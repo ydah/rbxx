@@ -18,8 +18,10 @@ template <typename T, typename Enable = void> struct type_caster;
 
 /// @brief True when T can be converted to a Ruby value.
 template <typename T>
-concept to_ruby_convertible = requires(const std::remove_cvref_t<T>& input) {
-  { type_caster<std::remove_cvref_t<T>>::dump(input) } -> std::convertible_to<value>;
+concept to_ruby_convertible = requires(T&& input) {
+  {
+    type_caster<std::remove_cvref_t<T>>::dump(std::forward<T>(input))
+  } -> std::convertible_to<value>;
 };
 
 /// @brief True when a Ruby value can be converted to T.
@@ -205,7 +207,7 @@ template <typename T> value to_ruby(T&& input) {
 
 /// @brief Converts a Ruby value to C++ with an actionable missing-caster diagnostic.
 /// @code int result = rbxx::from_ruby<int>(ruby_value); @endcode
-template <typename T> std::remove_cvref_t<T> from_ruby(value input) {
+template <typename T> decltype(auto) from_ruby(value input) {
   using converted_type = std::remove_cvref_t<T>;
   static_assert(from_ruby_convertible<converted_type>,
                 "rbxx: type has no type_caster; bind it with def_class<T>() or specialize "
