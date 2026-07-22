@@ -135,11 +135,21 @@ jobs:
         with:
           ruby-version: "3.4"
           bundler-cache: true
-      - run: >-
-          docker build
-          --file .github/docker/rake-compiler-dock-gcc12.Dockerfile
-          --tag rbxx-rake-compiler-dock:gcc12
-          .
+      - name: Build precompiled extension image
+        run: |
+          for attempt in 1 2 3; do
+            if docker build \
+              --file .github/docker/rake-compiler-dock-gcc12.Dockerfile \
+              --tag rbxx-rake-compiler-dock:gcc12 \
+              .; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            echo "::warning::Docker build attempt $attempt failed; retrying"
+            sleep "$((attempt * 5))"
+          done
       - run: bundle exec rake precompiled:x86_64-linux
         env:
           RCD_IMAGE: rbxx-rake-compiler-dock:gcc12
