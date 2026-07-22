@@ -37,8 +37,6 @@ class AdvancedTest < Minitest::Test
   end
 
   def test_debug_callback_rejects_invocation_without_gvl
-    skip_asan_nogvl_runtime_issue
-
     error = assert_raises(RuntimeError) do
       Advanced.apply_callback_without_gvl(->(value) { value })
     end
@@ -47,7 +45,6 @@ class AdvancedTest < Minitest::Test
 
   def test_nogvl_allows_ruby_threads_to_run_concurrently
     skip "wall-clock concurrency assertion is unstable under GC.stress" if ENV["RBXX_GC_STRESS"] == "1"
-    skip_asan_nogvl_runtime_issue
 
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     threads = 2.times.map { Thread.new { Advanced.blocking_work(250) } }
@@ -58,8 +55,6 @@ class AdvancedTest < Minitest::Test
   end
 
   def test_nogvl_interrupt_hook_stops_native_work
-    skip_asan_nogvl_runtime_issue
-
     thread = Thread.new { Advanced.interruptible_work(5_000) }
     thread.report_on_exception = false
     sleep 0.05
@@ -79,13 +74,5 @@ class AdvancedTest < Minitest::Test
     doubled = buffer.map { |value| value * 2 }
     assert_equal [2, 4, 6, 8], doubled
     assert_equal 4, buffer.each.size
-  end
-
-  private
-
-  def skip_asan_nogvl_runtime_issue
-    return unless ENV["ASAN_OPTIONS"]
-
-    skip "Ruby's native thread stack conflicts with AddressSanitizer (Ruby Bug #19761)"
   end
 end
