@@ -1,6 +1,7 @@
 #pragma once
 
 #include <rbxx/function.hpp>
+#include <rbxx/operators.hpp>
 
 #include <source_location>
 #include <utility>
@@ -21,9 +22,24 @@ public:
 
   /// @brief Defines a Ruby module function backed by a C++ callable.
   /// @code mod.def("sum", [](int a, int b) { return a + b; }); @endcode
-  template <typename Function> module& def(const char* name, Function&& function) {
-    detail::register_function(wrapped_.raw(), name, std::forward<Function>(function));
+  template <typename Function, typename... Specs>
+  module& def(const char* name, Function&& function, Specs&&... specs) {
+    using traits = detail::resolved_function_traits<std::decay_t<Function>>;
+    if constexpr (detail::function_signature<std::decay_t<Function>>) {
+      static_assert(sizeof...(Specs) == 0U ||
+                        sizeof...(Specs) ==
+                            detail::normal_argument_count<typename traits::args_tuple>(),
+                    "rbxx: argument annotation count must match callable parameters");
+    }
+    detail::register_function(wrapped_.raw(), name, std::forward<Function>(function),
+                              detail::make_argument_specs(std::forward<Specs>(specs)...));
     return *this;
+  }
+
+  template <typename Function, typename... Specs>
+  module& def(op::name operation, Function&& function, Specs&&... specs) {
+    return def(operation.ruby_name, std::forward<Function>(function),
+               std::forward<Specs>(specs)...);
   }
 
   /// @brief Defines a Ruby class backed by CRuby TypedData.
@@ -44,8 +60,10 @@ inline module define_module(const char* name) {
 
 /// @brief Defines a top-level Ruby global function.
 /// @code rbxx::define_global_function("native_sum", [](int a, int b) { return a + b; }); @endcode
-template <typename Function> void define_global_function(const char* name, Function&& function) {
-  detail::register_function(Qnil, name, std::forward<Function>(function), true);
+template <typename Function, typename... Specs>
+void define_global_function(const char* name, Function&& function, Specs&&... specs) {
+  detail::register_function(Qnil, name, std::forward<Function>(function),
+                            detail::make_argument_specs(std::forward<Specs>(specs)...), true);
 }
 
 } // namespace rbxx

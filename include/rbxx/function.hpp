@@ -1,5 +1,6 @@
 #pragma once
 
+#include <rbxx/arg.hpp>
 #include <rbxx/data_object.hpp>
 #include <rbxx/policies.hpp>
 
@@ -67,6 +68,42 @@ concept function_signature = requires {
   typename resolved_function_traits<std::decay_t<T>>::args_tuple;
 };
 
+template <typename Argument> int argument_match_score(value input) noexcept {
+  using type = std::remove_cvref_t<Argument>;
+  if constexpr (is_special_argument_v<type>) {
+    return 0;
+  } else if constexpr (std::is_integral_v<type> && !std::is_same_v<type, bool>) {
+    return input.is_integer() ? 2 : 0;
+  } else if constexpr (std::is_floating_point_v<type>) {
+    return input.is_float() ? 2 : (input.is_integer() ? 1 : 0);
+  } else if constexpr (std::is_same_v<type, std::string> ||
+                       std::is_same_v<type, std::string_view> ||
+                       std::is_same_v<type, const char*>) {
+    return input.is_string() ? 2 : 0;
+  } else if constexpr (std::is_same_v<type, value> || std::is_same_v<type, object>) {
+    return 1;
+  } else {
+    return type_caster<type>::matches(input) ? 2 : 0;
+  }
+}
+
+template <typename Tuple, std::size_t... Index>
+int tuple_match_score(int argc, const VALUE* argv, std::index_sequence<Index...>) noexcept {
+  if (argc != static_cast<int>(sizeof...(Index))) {
+    return -1;
+  }
+  std::array<int, sizeof...(Index)> scores{
+      argument_match_score<std::tuple_element_t<Index, Tuple>>(value{argv[Index]})...};
+  int total = 0;
+  for (int score : scores) {
+    if (score == 0) {
+      return -1;
+    }
+    total += score;
+  }
+  return total;
+}
+
 template <typename Tuple, std::size_t... Index>
 consteval bool arguments_convertible(std::index_sequence<Index...>) {
   return (from_ruby_convertible<std::tuple_element_t<Index, Tuple>> && ...);
@@ -83,15 +120,6 @@ template <typename Function> consteval bool function_return_convertible() {
   return std::is_void_v<result> || to_ruby_convertible<result>;
 }
 
-template <typename Argument> auto load_argument(value input) {
-  using loaded_type = decltype(from_ruby<Argument>(input));
-  if constexpr (std::is_lvalue_reference_v<loaded_type>) {
-    return std::ref(from_ruby<Argument>(input));
-  } else {
-    return from_ruby<Argument>(input);
-  }
-}
-
 template <typename Result> value dump_result(Result&& result, policy::kind selected);
 
 class native_function {
@@ -104,22 +132,19 @@ public:
   [[nodiscard]] virtual value invoke(int argc, const VALUE* argv, value self) = 0;
   [[nodiscard]] virtual std::string signature() const = 0;
   [[nodiscard]] virtual bool accepts_arity(int argc) const noexcept = 0;
+  [[nodiscard]] virtual int match_score(int argc, const VALUE* argv) const noexcept = 0;
+  [[nodiscard]] virtual std::size_t declared_arity() const noexcept = 0;
 };
 
 template <typename Function> class native_function_impl final : public native_function {
 public:
-  explicit native_function_impl(Function function) : function_(std::move(function)) {}
+  explicit native_function_impl(Function function, std::vector<argument_spec> specs = {})
+      : function_(std::move(function)), parser_(std::move(specs)) {}
 
   [[nodiscard]] value invoke(int argc, const VALUE* argv, value) override {
     using traits = resolved_function_traits<Function>;
-    constexpr auto expected = traits::arity;
-    if (argc != static_cast<int>(expected)) {
-      std::ostringstream message;
-      message << "rbxx: argument count mismatch for " << signature() << "; expected " << expected
-              << ", actual " << argc;
-      throw ruby_error(make_exception(rb_eArgError, message.str().c_str()));
-    }
-    return invoke_with_args(argv, std::make_index_sequence<expected>{});
+    parsed_arguments parsed = parser_.parse(argc, argv);
+    return invoke_with_args(parsed, std::make_index_sequence<traits::arity>{});
   }
 
   [[nodiscard]] std::string signature() const override {
@@ -127,16 +152,38 @@ public:
   }
 
   [[nodiscard]] bool accepts_arity(int argc) const noexcept override {
-    return argc == static_cast<int>(resolved_function_traits<Function>::arity);
+    using traits = resolved_function_traits<Function>;
+    if (has_rest_args(std::make_index_sequence<traits::arity>{})) {
+      return true;
+    }
+    if (parser_.configured() || has_special_args(std::make_index_sequence<traits::arity>{})) {
+      return argc <= static_cast<int>(traits::arity + 1U);
+    }
+    return argc == static_cast<int>(traits::arity);
+  }
+
+  [[nodiscard]] int match_score(int argc, const VALUE* argv) const noexcept override {
+    using traits = resolved_function_traits<Function>;
+    using args = typename traits::args_tuple;
+    if (parser_.configured() || has_special_args(std::make_index_sequence<traits::arity>{})) {
+      return accepts_arity(argc) ? 0 : -1;
+    }
+    return tuple_match_score<args>(argc, argv, std::make_index_sequence<traits::arity>{});
+  }
+
+  [[nodiscard]] std::size_t declared_arity() const noexcept override {
+    return resolved_function_traits<Function>::arity;
   }
 
 private:
   template <std::size_t... Index>
-  [[nodiscard]] value invoke_with_args(const VALUE* argv, std::index_sequence<Index...>) {
+  [[nodiscard]] value invoke_with_args(const parsed_arguments& parsed,
+                                       std::index_sequence<Index...>) {
     using traits = resolved_function_traits<Function>;
     using args = typename traits::args_tuple;
-    auto converted = std::tuple<decltype(load_argument<std::tuple_element_t<Index, args>>(value{
-        argv[Index]}))...>{load_argument<std::tuple_element_t<Index, args>>(value{argv[Index]})...};
+    auto converted = std::tuple<decltype(load_parsed_argument<std::tuple_element_t<Index, args>>(
+        parsed, Index))...>{
+        load_parsed_argument<std::tuple_element_t<Index, args>>(parsed, Index)...};
 
     if constexpr (std::is_void_v<typename traits::return_type>) {
       std::apply(function_, converted);
@@ -147,7 +194,20 @@ private:
     }
   }
 
+  template <std::size_t... Index>
+  static consteval bool has_special_args(std::index_sequence<Index...>) {
+    using args = typename resolved_function_traits<Function>::args_tuple;
+    return (is_special_argument_v<std::tuple_element_t<Index, args>> || ...);
+  }
+
+  template <std::size_t... Index>
+  static consteval bool has_rest_args(std::index_sequence<Index...>) {
+    using args = typename resolved_function_traits<Function>::args_tuple;
+    return (is_rest_argument_v<std::tuple_element_t<Index, args>> || ...);
+  }
+
   Function function_;
+  argument_parser<typename resolved_function_traits<Function>::args_tuple> parser_;
 };
 
 template <typename Result> value dump_result(Result&& result, policy::kind selected) {
@@ -247,12 +307,32 @@ inline VALUE function_trampoline(int argc, VALUE* argv, VALUE self) {
     if (functions == nullptr || functions->empty()) {
       throw std::runtime_error("rbxx: native function registry entry was not found");
     }
-    native_function* selected = functions->front().get();
+    native_function* selected = nullptr;
+    int best_score = -1;
     for (const auto& candidate : *functions) {
-      if (candidate->accepts_arity(argc)) {
+      int score = candidate->match_score(argc, argv);
+      if (score > best_score) {
+        best_score = score;
         selected = candidate.get();
-        break;
       }
+    }
+    if (selected == nullptr && functions->size() == 1U && functions->front()->accepts_arity(argc)) {
+      selected = functions->front().get();
+    }
+    if (selected == nullptr) {
+      std::string message = "rbxx: no matching overload";
+      if (functions->size() == 1U) {
+        message += "; expected ";
+        message += std::to_string(functions->front()->declared_arity());
+        message += ", actual ";
+        message += std::to_string(argc);
+      }
+      message += "; candidates:";
+      for (const auto& candidate : *functions) {
+        message += "\n  ";
+        message += candidate->signature();
+      }
+      throw ruby_error(make_exception(rb_eArgError, message.c_str()));
     }
     result = selected->invoke(argc, argv, value{self}).raw();
   } catch (...) {
@@ -265,7 +345,8 @@ inline VALUE function_trampoline(int argc, VALUE* argv, VALUE self) {
 }
 
 template <typename Function>
-void register_function(VALUE owner, const char* name, Function&& function, bool global = false) {
+void register_function(VALUE owner, const char* name, Function&& function,
+                       std::vector<argument_spec> specs = {}, bool global = false) {
   using stored_function = std::decay_t<Function>;
   if constexpr (!function_signature<stored_function>) {
     static_assert(
@@ -284,9 +365,10 @@ void register_function(VALUE owner, const char* name, Function&& function, bool 
         "or specialize rbxx::type_caster<T>");
   } else {
     ID method = protect(rb_intern, name);
-    const bool first = method_registry::instance().add(
-        global ? Qnil : owner, method,
-        std::make_unique<native_function_impl<stored_function>>(std::forward<Function>(function)));
+    const bool first =
+        method_registry::instance().add(global ? Qnil : owner, method,
+                                        std::make_unique<native_function_impl<stored_function>>(
+                                            std::forward<Function>(function), std::move(specs)));
     if (first) {
       protect([owner, name, global] {
         if (global) {
@@ -300,7 +382,8 @@ void register_function(VALUE owner, const char* name, Function&& function, bool 
 }
 
 template <typename Function>
-void register_static_function(VALUE owner, const char* name, Function&& function) {
+void register_static_function(VALUE owner, const char* name, Function&& function,
+                              std::vector<argument_spec> specs = {}) {
   using stored_function = std::decay_t<Function>;
   if constexpr (!function_signature<stored_function>) {
     static_assert(
@@ -315,9 +398,10 @@ void register_static_function(VALUE owner, const char* name, Function&& function
                   "rbxx: function return type has no type_caster");
   } else {
     ID method = protect(rb_intern, name);
-    const bool first = method_registry::instance().add(
-        owner, method,
-        std::make_unique<native_function_impl<stored_function>>(std::forward<Function>(function)));
+    const bool first =
+        method_registry::instance().add(owner, method,
+                                        std::make_unique<native_function_impl<stored_function>>(
+                                            std::forward<Function>(function), std::move(specs)));
     if (first) {
       protect([owner, name] { rb_define_singleton_method(owner, name, function_trampoline, -1); });
     }

@@ -174,7 +174,8 @@ template <typename T> VALUE allocate_data_object(VALUE klass) {
 }
 
 template <typename T> data_wrapper<T>& exact_wrapper(value self) {
-  if (!RTYPEDDATA_P(self.raw()) || RTYPEDDATA_TYPE(self.raw()) != &typed_data_type<T>()) {
+  if (!RB_TYPE_P(self.raw(), T_DATA) || !RTYPEDDATA_P(self.raw()) ||
+      RTYPEDDATA_TYPE(self.raw()) != &typed_data_type<T>()) {
     throw ruby_error(make_exception(rb_eTypeError, "rbxx: unexpected TypedData class"));
   }
   return *static_cast<data_wrapper<T>*>(RTYPEDDATA_DATA(self.raw()));
@@ -189,7 +190,7 @@ struct type_caster<T, std::enable_if_t<std::is_class_v<T> && !std::is_same_v<T, 
   static T& load(value input) { return detail::load_registered<T>(input); }
   static value dump(const T& input) { return detail::wrap_copy(input); }
   static value dump(T&& input) { return detail::wrap_move(std::move(input)); }
-  static bool matches(value input) noexcept { return RTYPEDDATA_P(input.raw()); }
+  static bool matches(value input) noexcept { return detail::registered_matches<T>(input); }
 };
 
 template <typename T> struct type_caster<T*> {
@@ -198,7 +199,9 @@ template <typename T> struct type_caster<T*> {
     return input.is_nil() ? nullptr : std::addressof(detail::load_registered<T>(input));
   }
   static value dump(T* input) { return detail::wrap_reference(input); }
-  static bool matches(value input) noexcept { return input.is_nil() || RTYPEDDATA_P(input.raw()); }
+  static bool matches(value input) noexcept {
+    return input.is_nil() || detail::registered_matches<T>(input);
+  }
 };
 
 template <typename T> struct type_caster<std::unique_ptr<T>> {
@@ -210,7 +213,9 @@ template <typename T> struct type_caster<std::unique_ptr<T>> {
 template <typename T> struct type_caster<std::shared_ptr<T>> {
   static constexpr std::string_view name = "shared C++ object";
   static value dump(std::shared_ptr<T> input) { return detail::wrap_shared(std::move(input)); }
-  static bool matches(value input) noexcept { return RTYPEDDATA_P(input.raw()); }
+  static bool matches(value input) noexcept {
+    return RB_TYPE_P(input.raw(), T_DATA) && RTYPEDDATA_P(input.raw());
+  }
 };
 
 } // namespace rbxx

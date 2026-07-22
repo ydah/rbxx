@@ -1,5 +1,6 @@
 #pragma once
 
+#include <rbxx/arg.hpp>
 #include <rbxx/class.hpp>
 #include <rbxx/data_object.hpp>
 #include <rbxx/detail/ruby_include.hpp>
@@ -7,6 +8,7 @@
 #include <rbxx/function.hpp>
 #include <rbxx/module.hpp>
 #include <rbxx/object.hpp>
+#include <rbxx/operators.hpp>
 #include <rbxx/policies.hpp>
 #include <rbxx/protect.hpp>
 #include <rbxx/registry.hpp>

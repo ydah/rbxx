@@ -101,7 +101,7 @@ template <typename T> class_info& registered_class() {
 
 template <typename T> T& load_registered(value input) {
   VALUE raw = input.raw();
-  if (!RTYPEDDATA_P(raw)) {
+  if (!RB_TYPE_P(raw, T_DATA) || !RTYPEDDATA_P(raw)) {
     std::string message = "rbxx: expected registered C++ type ";
     message += type_name<T>();
     message += ", got ";
@@ -131,6 +131,15 @@ template <typename T> T& load_registered(value input) {
     throw ruby_error(make_exception(rb_eRuntimeError, "rbxx: C++ object is not initialized"));
   }
   return *static_cast<T*>(conversion->second(native));
+}
+
+template <typename T> bool registered_matches(value input) noexcept {
+  if (!RB_TYPE_P(input.raw(), T_DATA) || !RTYPEDDATA_P(input.raw())) {
+    return false;
+  }
+  class_info* actual = type_registry::instance().find(RTYPEDDATA_TYPE(input.raw()));
+  return actual != nullptr &&
+         actual->conversions.contains(std::type_index(typeid(std::remove_cv_t<T>)));
 }
 
 } // namespace rbxx::detail

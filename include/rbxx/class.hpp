@@ -50,15 +50,12 @@ inline void define_instance_trampoline(VALUE klass, const char* name) {
 
 template <typename T, typename... Args> class constructor_function final : public native_function {
 public:
-  [[nodiscard]] value invoke(int argc, const VALUE* argv, value self) override {
-    if (!accepts_arity(argc)) {
-      std::ostringstream message;
-      message << "rbxx: argument count mismatch for constructor; expected " << sizeof...(Args)
-              << ", actual " << argc;
-      throw ruby_error(make_exception(rb_eArgError, message.str().c_str()));
-    }
+  explicit constructor_function(std::vector<argument_spec> specs = {})
+      : parser_(std::move(specs)) {}
 
-    auto converted = load(argv, std::index_sequence_for<Args...>{});
+  [[nodiscard]] value invoke(int argc, const VALUE* argv, value self) override {
+    parsed_arguments parsed = parser_.parse(argc, argv);
+    auto converted = load(parsed, std::index_sequence_for<Args...>{});
     auto& wrapper = exact_wrapper<T>(self);
     if (wrapper.pointer != nullptr) {
       throw ruby_error(make_exception(rb_eRuntimeError, "rbxx: C++ object is already initialized"));
@@ -75,46 +72,72 @@ public:
   }
 
   [[nodiscard]] bool accepts_arity(int argc) const noexcept override {
-    return argc == static_cast<int>(sizeof...(Args));
+    return parser_.configured() ? argc <= static_cast<int>(sizeof...(Args) + 1U)
+                                : argc == static_cast<int>(sizeof...(Args));
   }
+
+  [[nodiscard]] int match_score(int argc, const VALUE* argv) const noexcept override {
+    if (parser_.configured()) {
+      return accepts_arity(argc) ? 0 : -1;
+    }
+    using tuple = std::tuple<Args...>;
+    return tuple_match_score<tuple>(argc, argv, std::index_sequence_for<Args...>{});
+  }
+
+  [[nodiscard]] std::size_t declared_arity() const noexcept override { return sizeof...(Args); }
 
 private:
   template <std::size_t... Index>
-  static auto load(const VALUE* argv, std::index_sequence<Index...>) {
-    return std::tuple<decltype(load_argument<Args>(value{argv[Index]}))...>{
-        load_argument<Args>(value{argv[Index]})...};
+  static auto load(const parsed_arguments& parsed, std::index_sequence<Index...>) {
+    return std::tuple<decltype(load_parsed_argument<Args>(parsed, Index))...>{
+        load_parsed_argument<Args>(parsed, Index)...};
   }
+
+  argument_parser<std::tuple<Args...>> parser_;
 };
 
 template <typename Bound, typename Method> class member_function final : public native_function {
 public:
-  member_function(Method method, policy::kind selected) : method_(method), policy_(selected) {}
+  member_function(Method method, policy::kind selected, std::vector<argument_spec> specs = {})
+      : method_(method), policy_(selected), parser_(std::move(specs)) {}
 
   [[nodiscard]] value invoke(int argc, const VALUE* argv, value self) override {
     using traits = member_method_traits<Method>;
-    if (!accepts_arity(argc)) {
-      std::ostringstream message;
-      message << "rbxx: argument count mismatch for " << signature() << "; expected "
-              << traits::arity << ", actual " << argc;
-      throw ruby_error(make_exception(rb_eArgError, message.str().c_str()));
-    }
+    parsed_arguments parsed = parser_.parse(argc, argv);
     Bound& native = load_registered<Bound>(self);
-    return invoke_native(native, argv, std::make_index_sequence<traits::arity>{});
+    return invoke_native(native, parsed, std::make_index_sequence<traits::arity>{});
   }
 
   [[nodiscard]] std::string signature() const override { return std::string(type_name<Method>()); }
 
   [[nodiscard]] bool accepts_arity(int argc) const noexcept override {
-    return argc == static_cast<int>(member_method_traits<Method>::arity);
+    constexpr auto arity = member_method_traits<Method>::arity;
+    return parser_.configured() ? argc <= static_cast<int>(arity + 1U)
+                                : argc == static_cast<int>(arity);
+  }
+
+  [[nodiscard]] int match_score(int argc, const VALUE* argv) const noexcept override {
+    using traits = member_method_traits<Method>;
+    if (parser_.configured()) {
+      return accepts_arity(argc) ? 0 : -1;
+    }
+    return tuple_match_score<typename traits::args_tuple>(
+        argc, argv, std::make_index_sequence<traits::arity>{});
+  }
+
+  [[nodiscard]] std::size_t declared_arity() const noexcept override {
+    return member_method_traits<Method>::arity;
   }
 
 private:
   template <std::size_t... Index>
-  [[nodiscard]] value invoke_native(Bound& self, const VALUE* argv, std::index_sequence<Index...>) {
+  [[nodiscard]] value invoke_native(Bound& self, const parsed_arguments& parsed,
+                                    std::index_sequence<Index...>) {
     using traits = member_method_traits<Method>;
     using args = typename traits::args_tuple;
-    auto converted = std::tuple<decltype(load_argument<std::tuple_element_t<Index, args>>(value{
-        argv[Index]}))...>{load_argument<std::tuple_element_t<Index, args>>(value{argv[Index]})...};
+    auto converted = std::tuple<decltype(load_parsed_argument<std::tuple_element_t<Index, args>>(
+        parsed, Index))...>{
+        load_parsed_argument<std::tuple_element_t<Index, args>>(parsed, Index)...};
     if constexpr (std::is_void_v<typename traits::return_type>) {
       std::apply([&](auto&&... values) { std::invoke(method_, self, values...); }, converted);
       return value{Qnil};
@@ -128,6 +151,7 @@ private:
 
   Method method_;
   policy::kind policy_;
+  argument_parser<typename member_method_traits<Method>::args_tuple> parser_;
 };
 
 template <typename Tuple, std::size_t... Index>
@@ -135,14 +159,22 @@ consteval bool self_arguments_convertible(std::index_sequence<Index...>) {
   return (from_ruby_convertible<std::tuple_element_t<Index + 1U, Tuple>> && ...);
 }
 
+template <typename Tuple, std::size_t... Index>
+auto tuple_tail_type(std::index_sequence<Index...>)
+    -> std::tuple<std::tuple_element_t<Index + 1U, Tuple>...>;
+
+template <typename Tuple>
+using tuple_tail_t =
+    decltype(tuple_tail_type<Tuple>(std::make_index_sequence<std::tuple_size_v<Tuple> - 1U>{}));
+
 template <typename Bound, typename Function> class self_function final : public native_function {
 public:
   using traits = resolved_function_traits<Function>;
   using args = typename traits::args_tuple;
   static constexpr std::size_t ruby_arity = traits::arity - 1U;
 
-  self_function(Function function, policy::kind selected)
-      : function_(std::move(function)), policy_(selected) {
+  self_function(Function function, policy::kind selected, std::vector<argument_spec> specs = {})
+      : function_(std::move(function)), policy_(selected), parser_(std::move(specs)) {
     static_assert(traits::arity > 0,
                   "rbxx: instance lambda must accept self as its first argument");
     using self_argument = std::tuple_element_t<0, args>;
@@ -154,29 +186,35 @@ public:
   }
 
   [[nodiscard]] value invoke(int argc, const VALUE* argv, value self) override {
-    if (!accepts_arity(argc)) {
-      std::ostringstream message;
-      message << "rbxx: argument count mismatch for " << signature() << "; expected " << ruby_arity
-              << ", actual " << argc;
-      throw ruby_error(make_exception(rb_eArgError, message.str().c_str()));
-    }
+    parsed_arguments parsed = parser_.parse(argc, argv);
     Bound& native = load_registered<Bound>(self);
-    return invoke_native(native, argv, std::make_index_sequence<ruby_arity>{});
+    return invoke_native(native, parsed, std::make_index_sequence<ruby_arity>{});
   }
 
   [[nodiscard]] std::string signature() const override {
     return std::string(type_name<Function>());
   }
   [[nodiscard]] bool accepts_arity(int argc) const noexcept override {
-    return argc == static_cast<int>(ruby_arity);
+    return parser_.configured() ? argc <= static_cast<int>(ruby_arity + 1U)
+                                : argc == static_cast<int>(ruby_arity);
   }
+  [[nodiscard]] int match_score(int argc, const VALUE* argv) const noexcept override {
+    if (parser_.configured()) {
+      return accepts_arity(argc) ? 0 : -1;
+    }
+    using ruby_args = tuple_tail_t<args>;
+    return tuple_match_score<ruby_args>(argc, argv, std::make_index_sequence<ruby_arity>{});
+  }
+  [[nodiscard]] std::size_t declared_arity() const noexcept override { return ruby_arity; }
 
 private:
   template <std::size_t... Index>
-  [[nodiscard]] value invoke_native(Bound& self, const VALUE* argv, std::index_sequence<Index...>) {
-    auto converted = std::tuple<decltype(load_argument<std::tuple_element_t<Index + 1U, args>>(
-        value{argv[Index]}))...>{
-        load_argument<std::tuple_element_t<Index + 1U, args>>(value{argv[Index]})...};
+  [[nodiscard]] value invoke_native(Bound& self, const parsed_arguments& parsed,
+                                    std::index_sequence<Index...>) {
+    auto converted =
+        std::tuple<decltype(load_parsed_argument<std::tuple_element_t<Index + 1U, args>>(
+            parsed, Index))...>{
+            load_parsed_argument<std::tuple_element_t<Index + 1U, args>>(parsed, Index)...};
     if constexpr (std::is_void_v<typename traits::return_type>) {
       std::apply([&](auto&&... values) { std::invoke(function_, self, values...); }, converted);
       return value{Qnil};
@@ -192,6 +230,7 @@ private:
 
   Function function_;
   policy::kind policy_;
+  argument_parser<tuple_tail_t<args>> parser_;
 };
 
 } // namespace detail
@@ -204,50 +243,63 @@ public:
 
   [[nodiscard]] value get() const noexcept { return ruby_class_; }
 
-  template <typename... Args> class_& def(init_tag<Args...>) {
+  template <typename... Args, typename... Specs>
+    requires((std::is_convertible_v<Specs, argument_spec>) && ...)
+  class_& def(init_tag<Args...>, Specs&&... specs) {
+    static_assert(sizeof...(Specs) == 0U ||
+                      sizeof...(Specs) == detail::normal_argument_count<std::tuple<Args...>>(),
+                  "rbxx: argument annotation count must match constructor parameters");
     static_assert((from_ruby_convertible<Args> && ...),
                   "rbxx: constructor argument type has no type_caster");
     ID method = protect(rb_intern, "initialize");
     const bool first = detail::method_registry::instance().add(
-        ruby_class_.raw(), method, std::make_unique<detail::constructor_function<T, Args...>>());
+        ruby_class_.raw(), method,
+        std::make_unique<detail::constructor_function<T, Args...>>(
+            detail::make_argument_specs(std::forward<Specs>(specs)...)));
     if (first) {
       detail::define_instance_trampoline(ruby_class_.raw(), "initialize");
     }
     return *this;
   }
 
-  template <typename Function>
-  class_& def(const char* name, Function&& function,
-              policy::return_value_policy selected = policy::automatic) {
-    using stored_function = std::decay_t<Function>;
-    ID method = protect(rb_intern, name);
-    if constexpr (std::is_member_function_pointer_v<stored_function>) {
-      using traits = detail::member_method_traits<stored_function>;
-      static_assert(detail::arguments_convertible<typename traits::args_tuple>(
-                        std::make_index_sequence<traits::arity>{}),
-                    "rbxx: member function argument type has no type_caster");
-      const bool first = detail::method_registry::instance().add(
-          ruby_class_.raw(), method,
-          std::make_unique<detail::member_function<T, stored_function>>(function, selected.value));
-      if (first) {
-        detail::define_instance_trampoline(ruby_class_.raw(), name);
-      }
-    } else {
-      static_assert(detail::function_signature<stored_function>,
-                    "rbxx: instance callable signature cannot be determined");
-      const bool first = detail::method_registry::instance().add(
-          ruby_class_.raw(), method,
-          std::make_unique<detail::self_function<T, stored_function>>(
-              std::forward<Function>(function), selected.value));
-      if (first) {
-        detail::define_instance_trampoline(ruby_class_.raw(), name);
-      }
-    }
-    return *this;
+  template <typename Function, typename... Specs>
+    requires((std::is_convertible_v<Specs, argument_spec>) && ...)
+  class_& def(const char* name, Function&& function, Specs&&... specs) {
+    return bind_function(name, std::forward<Function>(function), policy::automatic,
+                         detail::make_argument_specs(std::forward<Specs>(specs)...));
   }
 
-  template <typename Function> class_& def_static(const char* name, Function&& function) {
-    detail::register_static_function(ruby_class_.raw(), name, std::forward<Function>(function));
+  template <typename Function, typename... Specs>
+    requires((std::is_convertible_v<Specs, argument_spec>) && ...)
+  class_& def(const char* name, Function&& function, policy::return_value_policy selected,
+              Specs&&... specs) {
+    return bind_function(name, std::forward<Function>(function), selected,
+                         detail::make_argument_specs(std::forward<Specs>(specs)...));
+  }
+
+  template <typename Function, typename... Specs>
+    requires((std::is_convertible_v<Specs, argument_spec>) && ...)
+  class_& def(op::name operation, Function&& function, Specs&&... specs) {
+    class_& result =
+        def(operation.ruby_name, std::forward<Function>(function), std::forward<Specs>(specs)...);
+    include_comparable(operation);
+    return result;
+  }
+
+  template <typename Function, typename... Specs>
+    requires((std::is_convertible_v<Specs, argument_spec>) && ...)
+  class_& def(op::name operation, Function&& function, policy::return_value_policy selected,
+              Specs&&... specs) {
+    class_& result = def(operation.ruby_name, std::forward<Function>(function), selected,
+                         std::forward<Specs>(specs)...);
+    include_comparable(operation);
+    return result;
+  }
+
+  template <typename Function, typename... Specs>
+  class_& def_static(const char* name, Function&& function, Specs&&... specs) {
+    detail::register_static_function(ruby_class_.raw(), name, std::forward<Function>(function),
+                                     detail::make_argument_specs(std::forward<Specs>(specs)...));
     return *this;
   }
 
@@ -269,6 +321,42 @@ public:
   }
 
 private:
+  void include_comparable(op::name operation) {
+    if (operation.include_comparable) {
+      protect(rb_include_module, ruby_class_.raw(), rb_mComparable);
+    }
+  }
+
+  template <typename Function>
+  class_& bind_function(const char* name, Function&& function, policy::return_value_policy selected,
+                        std::vector<argument_spec> specs) {
+    using stored_function = std::decay_t<Function>;
+    ID method = protect(rb_intern, name);
+    if constexpr (std::is_member_function_pointer_v<stored_function>) {
+      using traits = detail::member_method_traits<stored_function>;
+      static_assert(detail::arguments_convertible<typename traits::args_tuple>(
+                        std::make_index_sequence<traits::arity>{}),
+                    "rbxx: member function argument type has no type_caster");
+      const bool first = detail::method_registry::instance().add(
+          ruby_class_.raw(), method,
+          std::make_unique<detail::member_function<T, stored_function>>(function, selected.value,
+                                                                        std::move(specs)));
+      if (first) {
+        detail::define_instance_trampoline(ruby_class_.raw(), name);
+      }
+    } else {
+      static_assert(detail::function_signature<stored_function>,
+                    "rbxx: instance callable signature cannot be determined");
+      const bool first = detail::method_registry::instance().add(
+          ruby_class_.raw(), method,
+          std::make_unique<detail::self_function<T, stored_function>>(
+              std::forward<Function>(function), selected.value, std::move(specs)));
+      if (first) {
+        detail::define_instance_trampoline(ruby_class_.raw(), name);
+      }
+    }
+    return *this;
+  }
   value ruby_class_;
 };
 
