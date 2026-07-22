@@ -70,7 +70,8 @@ end
 
 def check(output)
   abort "#{OUTPUT} is missing; run rake amalgamate" unless OUTPUT.file?
-  return if OUTPUT.binread == output
+  checked_in = OUTPUT.binread.gsub("\r\n", "\n")
+  return if checked_in == output.gsub("\r\n", "\n")
 
   abort "#{OUTPUT} is stale; run rake amalgamate"
 end
