@@ -1,0 +1,5 @@
+# frozen_string_literal: true
+
+require "rbxx/mkmf"
+
+create_rbxx_cmake_makefile("<%= name %>/<%= name %>", source_dir: __dir__)

@@ -1,0 +1,14 @@
+cmake_minimum_required(VERSION 3.20)
+project(<%= name %> LANGUAGES CXX)
+
+find_package(rbxx CONFIG REQUIRED)
+add_library(<%= name %> MODULE <%= name %>.cpp)
+target_link_libraries(<%= name %> PRIVATE rbxx::rbxx)
+set_target_properties(<%= name %> PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED YES
+  PREFIX ""
+  SUFFIX ".${Ruby_DLEXT}"
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+  LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}"
+)

@@ -1,0 +1,23 @@
+#include <rbxx/rbxx.hpp>
+
+namespace {
+
+class counter {
+public:
+  explicit counter(int initial) : value_(initial) {}
+  void increment() { ++value_; }
+  [[nodiscard]] int value() const { return value_; }
+
+private:
+  int value_;
+};
+
+} // namespace
+
+RBXX_EXTENSION(<%= name %>) {
+  rbxx::module root = rbxx::define_module("<%= class_name %>");
+  root.def_class<counter>("Counter")
+      .def(rbxx::init<int>(), rbxx::kwarg("start") = 0)
+      .def("increment", &counter::increment)
+      .def("value", &counter::value);
+}

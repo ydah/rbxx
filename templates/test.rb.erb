@@ -1,0 +1,12 @@
+# frozen_string_literal: true
+
+require "minitest/autorun"
+require "<%= name %>"
+
+class <%= class_name %>Test < Minitest::Test
+  def test_generated_counter
+    counter = <%= class_name %>::Counter.new(start: 2)
+    counter.increment
+    assert_equal 3, counter.value
+  end
+end

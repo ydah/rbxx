@@ -20,9 +20,8 @@ Gem::Specification.new do |spec|
   spec.metadata["rubygems_mfa_required"] = "true"
 
   spec.files = Dir.chdir(__dir__) do
-    `git ls-files -z`.split("\x0").reject do |file|
-      file.start_with?(*%w[.github/ .idea/ spec/]) || file == "Gemfile"
-    end
+    Dir["{exe,ext-cmake,include,lib,single_include,templates}/**/*", "*.md", "LICENSE.txt"]
+      .select { |file| File.file?(file) }
   end
   spec.bindir = "exe"
   spec.executables = spec.files.grep(%r{\Aexe/}) { |file| File.basename(file) }

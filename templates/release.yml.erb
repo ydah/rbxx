@@ -1,0 +1,21 @@
+name: Native gems
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  linux-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - run: bundle exec rake precompiled:x86_64-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-gems
+          path: pkg/*.gem

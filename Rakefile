@@ -7,6 +7,7 @@ require "rake/clean"
 require "rake/testtask"
 require "open3"
 require "shellwords"
+require_relative "lib/rbxx/rake_tasks"
 
 ROOT = File.expand_path(__dir__)
 TEST_BUILD_ROOT = File.join(ROOT, "tmp", "test_extensions")
@@ -26,11 +27,9 @@ namespace :compile do
         File.join(build_dir, "extconf.rb"),
         <<~RUBY
           # frozen_string_literal: true
-          require "mkmf"
-          $CPPFLAGS = "-I#{File.join(ROOT, 'include')}" + " " + $CPPFLAGS
-          $CXXFLAGS = "-std=c++20 -Wall -Wextra" + " " + $CXXFLAGS unless /mswin|msvc/ =~ RUBY_PLATFORM
-          $CXXFLAGS = "/std:c++20 /EHsc /utf-8" + " " + $CXXFLAGS if /mswin|msvc/ =~ RUBY_PLATFORM
-          create_makefile("#{name}")
+          $LOAD_PATH.unshift(#{File.join(ROOT, 'lib').inspect})
+          require "rbxx/mkmf"
+          create_rbxx_makefile("#{name}", include_path: #{File.join(ROOT, 'include').inspect})
         RUBY
       )
 
@@ -105,7 +104,7 @@ namespace :amalgamate do
     FileUtils.mkdir_p(build_dir)
     File.write(File.join(build_dir, "single_header_smoke.cpp"), <<~CPP)
       #include <rbxx/rbxx.hpp>
-      extern "C" void Init_single_header_smoke() {}
+      extern "C" RBXX_EXPORT void Init_single_header_smoke() {}
     CPP
     File.write(File.join(build_dir, "extconf.rb"), <<~RUBY)
       require "mkmf"
@@ -123,3 +122,5 @@ end
 
 desc "Generate the rbxx single header"
 task amalgamate: "amalgamate:generate"
+
+Rbxx::RakeTasks.install(command: "bundle install && rake amalgamate:smoke")
