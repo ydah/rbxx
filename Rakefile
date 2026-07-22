@@ -5,6 +5,7 @@ require "fileutils"
 require "rbconfig"
 require "rake/clean"
 require "rake/testtask"
+require "open3"
 require "shellwords"
 
 ROOT = File.expand_path(__dir__)
@@ -55,6 +56,20 @@ namespace :test do
     loader = 'Dir["test/ruby/test_*.rb"].sort.each { |file| require File.expand_path(file) }'
     sh({ "RBXX_GC_STRESS" => "1" }, RbConfig.ruby, "-Ilib", "-I#{TEST_BUILD_ROOT}",
        "-Itest/ruby", "-e", loader)
+  end
+
+  desc "Verify expected compile-time diagnostics"
+  task :compile_fail do
+    FileList[File.join(ROOT, "test", "compile_fail", "*.cpp")].each do |source|
+      expected = File.foreach(source).first.to_s.delete_prefix("// EXPECT:").strip
+      includes = [File.join(ROOT, "include"), RbConfig::CONFIG.fetch("rubyhdrdir"),
+                  RbConfig::CONFIG.fetch("rubyarchhdrdir")]
+      command = [RbConfig::CONFIG.fetch("CXX"), "-std=c++20", "-fsyntax-only",
+                 *includes.map { |path| "-I#{path}" }, source]
+      _stdout, stderr, status = Open3.capture3(*command)
+      raise "#{source} unexpectedly compiled" if status.success?
+      raise "#{source} did not contain expected diagnostic: #{expected}\n#{stderr}" unless stderr.include?(expected)
+    end
   end
 end
 
