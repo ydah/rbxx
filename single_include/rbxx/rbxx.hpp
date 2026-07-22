@@ -945,6 +945,8 @@ auto load_parsed_argument(const parsed_arguments& parsed, std::size_t index) {
 
 // BEGIN rbxx/policies.hpp
 
+#include <cstddef>
+
 namespace rbxx {
 
 namespace policy {
@@ -962,6 +964,14 @@ inline constexpr return_value_policy reference{kind::reference};
 inline constexpr return_value_policy shared{kind::shared};
 
 } // namespace policy
+
+/// @brief Keeps one Ruby object alive for as long as another remains reachable.
+/// @details Index 0 is the return value, 1 is self, and 2 onward are arguments.
+/// @code .def("child", &Owner::child, policy::reference, keep_alive<0, 1>()) @endcode
+template <std::size_t Nurse, std::size_t Patient> struct keep_alive {
+  static constexpr std::size_t nurse = Nurse;
+  static constexpr std::size_t patient = Patient;
+};
 
 } // namespace rbxx
 // END rbxx/policies.hpp
@@ -1333,10 +1343,66 @@ template <typename T> struct type_caster<std::shared_ptr<T>> {
 } // namespace rbxx
 // END rbxx/data_object.hpp
 
+// BEGIN rbxx/callback.hpp
+
+
+#include <array>
+#include <functional>
+#include <stdexcept>
+#include <type_traits>
+#include <utility>
+
+namespace rbxx {
+
+namespace detail {
+
+template <typename Return, typename... Args>
+struct is_non_bindable_class<std::function<Return(Args...)>> : std::true_type {};
+
+inline void require_callback_gvl() {
+#if defined(RBXX_DEBUG)
+  if (ruby_thread_has_gvl_p() == 0) {
+    throw std::runtime_error(
+        "rbxx: Ruby callback invoked without the GVL; reacquire it before calling the Proc");
+  }
+#endif
+}
+
+} // namespace detail
+
+/// @brief Converts a Ruby Proc into a GC-pinned C++ std::function.
+template <typename Return, typename... Args> struct type_caster<std::function<Return(Args...)>> {
+  static constexpr std::string_view name = "Proc";
+
+  static std::function<Return(Args...)> load(value input) {
+    if (!matches(input)) {
+      detail::throw_type_error("Proc", input);
+    }
+    object callable{input};
+    return [callable = std::move(callable)](Args... args) -> Return {
+      detail::require_callback_gvl();
+      std::array<VALUE, sizeof...(Args)> converted{to_ruby(std::forward<Args>(args)).raw()...};
+      VALUE result = protect(rb_funcallv, callable.raw(), rb_intern("call"),
+                             static_cast<int>(converted.size()), converted.data());
+      if constexpr (std::is_void_v<Return>) {
+        return;
+      } else {
+        return from_ruby<Return>(value{result});
+      }
+    };
+  }
+
+  static bool matches(value input) noexcept { return RTEST(rb_obj_is_proc(input.raw())); }
+};
+
+} // namespace rbxx
+// END rbxx/callback.hpp
+
 // BEGIN rbxx/function.hpp
 
 
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -1349,6 +1415,57 @@ template <typename T> struct type_caster<std::shared_ptr<T>> {
 #include <vector>
 
 namespace rbxx::detail {
+
+struct keep_alive_spec {
+  std::size_t nurse;
+  std::size_t patient;
+};
+
+template <std::size_t Nurse, std::size_t Patient>
+constexpr keep_alive_spec make_keep_alive_spec(keep_alive<Nurse, Patient>) noexcept {
+  return {Nurse, Patient};
+}
+
+inline value keep_alive_value(std::size_t index, value result, value self, int argc,
+                              const VALUE* argv) {
+  if (index == 0U) {
+    return result;
+  }
+  if (index == 1U) {
+    return self;
+  }
+  const std::size_t argument = index - 2U;
+  if (argument >= static_cast<std::size_t>(argc)) {
+    throw std::out_of_range("rbxx: keep_alive index exceeds the Ruby argument count");
+  }
+  return value{argv[argument]};
+}
+
+inline void apply_keep_alive(const std::vector<keep_alive_spec>& policies, value result, value self,
+                             int argc, const VALUE* argv) {
+  for (const keep_alive_spec& selected : policies) {
+    value nurse = keep_alive_value(selected.nurse, result, self, argc, argv);
+    value patient = keep_alive_value(selected.patient, result, self, argc, argv);
+    if (nurse.is_nil() || patient.is_nil()) {
+      continue;
+    }
+    if (selected.nurse > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
+      throw std::out_of_range("rbxx: keep_alive nurse index is too large");
+    }
+    std::string name = "@__rbxx_keep_" + std::to_string(selected.nurse);
+    protect([nurse, patient, &name] {
+      ID id = rb_intern(name.c_str());
+      VALUE storage = rb_ivar_get(nurse.raw(), id);
+      if (NIL_P(storage)) {
+        storage = rb_ary_new();
+        rb_ivar_set(nurse.raw(), id, storage);
+      } else if (!RB_TYPE_P(storage, T_ARRAY)) {
+        rb_raise(rb_eTypeError, "rbxx: keep_alive storage was replaced with a non-Array");
+      }
+      rb_ary_push(storage, patient.raw());
+    });
+  }
+}
 
 template <typename T> struct function_traits;
 
@@ -1844,6 +1961,7 @@ void define_global_function(const char* name, Function&& function, Specs&&... sp
 // BEGIN rbxx/class.hpp
 
 
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -1940,14 +2058,18 @@ private:
 
 template <typename Bound, typename Method> class member_function final : public native_function {
 public:
-  member_function(Method method, policy::kind selected, std::vector<argument_spec> specs = {})
-      : method_(method), policy_(selected), parser_(std::move(specs)) {}
+  member_function(Method method, policy::kind selected, std::vector<argument_spec> specs = {},
+                  std::vector<keep_alive_spec> keep_alive = {})
+      : method_(method), policy_(selected), parser_(std::move(specs)),
+        keep_alive_(std::move(keep_alive)) {}
 
   [[nodiscard]] value invoke(int argc, const VALUE* argv, value self) override {
     using traits = member_method_traits<Method>;
     parsed_arguments parsed = parser_.parse(argc, argv);
     Bound& native = load_registered<Bound>(self);
-    return invoke_native(native, parsed, std::make_index_sequence<traits::arity>{});
+    value result = invoke_native(native, parsed, std::make_index_sequence<traits::arity>{});
+    apply_keep_alive(keep_alive_, result, self, argc, argv);
+    return result;
   }
 
   [[nodiscard]] std::string signature() const override { return std::string(type_name<Method>()); }
@@ -1994,6 +2116,7 @@ private:
   Method method_;
   policy::kind policy_;
   argument_parser<typename member_method_traits<Method>::args_tuple> parser_;
+  std::vector<keep_alive_spec> keep_alive_;
 };
 
 template <typename Tuple, std::size_t... Index>
@@ -2015,8 +2138,10 @@ public:
   using args = typename traits::args_tuple;
   static constexpr std::size_t ruby_arity = traits::arity - 1U;
 
-  self_function(Function function, policy::kind selected, std::vector<argument_spec> specs = {})
-      : function_(std::move(function)), policy_(selected), parser_(std::move(specs)) {
+  self_function(Function function, policy::kind selected, std::vector<argument_spec> specs = {},
+                std::vector<keep_alive_spec> keep_alive = {})
+      : function_(std::move(function)), policy_(selected), parser_(std::move(specs)),
+        keep_alive_(std::move(keep_alive)) {
     static_assert(traits::arity > 0,
                   "rbxx: instance lambda must accept self as its first argument");
     using self_argument = std::tuple_element_t<0, args>;
@@ -2030,7 +2155,9 @@ public:
   [[nodiscard]] value invoke(int argc, const VALUE* argv, value self) override {
     parsed_arguments parsed = parser_.parse(argc, argv);
     Bound& native = load_registered<Bound>(self);
-    return invoke_native(native, parsed, std::make_index_sequence<ruby_arity>{});
+    value result = invoke_native(native, parsed, std::make_index_sequence<ruby_arity>{});
+    apply_keep_alive(keep_alive_, result, self, argc, argv);
+    return result;
   }
 
   [[nodiscard]] std::string signature() const override {
@@ -2073,6 +2200,55 @@ private:
   Function function_;
   policy::kind policy_;
   argument_parser<tuple_tail_t<args>> parser_;
+  std::vector<keep_alive_spec> keep_alive_;
+};
+
+template <typename Bound, auto Begin, auto End>
+class iterable_function final : public native_function {
+public:
+  [[nodiscard]] value invoke(int, const VALUE*, value self) override {
+    if (rb_block_given_p() == 0) {
+      VALUE enumerator = protect([self] {
+        return rb_enumeratorize_with_size(self.raw(), ID2SYM(rb_intern("each")), 0, nullptr,
+                                          size_callback);
+      });
+      return value{enumerator};
+    }
+
+    Bound& native = load_registered<Bound>(self);
+    auto iterator = std::invoke(Begin, native);
+    const auto finish = std::invoke(End, native);
+    for (; iterator != finish; ++iterator) {
+      value item = to_ruby(*iterator);
+      protect(rb_yield, item.raw());
+    }
+    return self;
+  }
+
+  [[nodiscard]] std::string signature() const override { return "each()"; }
+  [[nodiscard]] bool accepts_arity(int argc) const noexcept override { return argc == 0; }
+  [[nodiscard]] int match_score(int argc, const VALUE*) const noexcept override {
+    return argc == 0 ? 0 : -1;
+  }
+  [[nodiscard]] std::size_t declared_arity() const noexcept override { return 0U; }
+
+private:
+  static VALUE size_callback(VALUE self, VALUE, VALUE) {
+    VALUE result = Qnil;
+    VALUE pending = Qnil;
+    try {
+      Bound& native = load_registered<Bound>(value{self});
+      auto first = std::invoke(Begin, native);
+      auto last = std::invoke(End, native);
+      result = to_ruby(std::distance(first, last)).raw();
+    } catch (...) {
+      pending = translate_current_exception();
+    }
+    if (!NIL_P(pending)) {
+      rb_exc_raise(pending);
+    }
+    return result;
+  }
 };
 
 } // namespace detail
@@ -2119,6 +2295,24 @@ public:
                          detail::make_argument_specs(std::forward<Specs>(specs)...));
   }
 
+  template <typename Function, std::size_t Nurse, std::size_t Patient, typename... Specs>
+    requires((std::is_convertible_v<Specs, argument_spec>) && ...)
+  class_& def(const char* name, Function&& function, policy::return_value_policy selected,
+              keep_alive<Nurse, Patient> lifetime, Specs&&... specs) {
+    return bind_function(name, std::forward<Function>(function), selected,
+                         detail::make_argument_specs(std::forward<Specs>(specs)...),
+                         {detail::make_keep_alive_spec(lifetime)});
+  }
+
+  template <typename Function, std::size_t Nurse, std::size_t Patient, typename... Specs>
+    requires((std::is_convertible_v<Specs, argument_spec>) && ...)
+  class_& def(const char* name, Function&& function, keep_alive<Nurse, Patient> lifetime,
+              Specs&&... specs) {
+    return bind_function(name, std::forward<Function>(function), policy::automatic,
+                         detail::make_argument_specs(std::forward<Specs>(specs)...),
+                         {detail::make_keep_alive_spec(lifetime)});
+  }
+
   template <typename Function, typename... Specs>
     requires((std::is_convertible_v<Specs, argument_spec>) && ...)
   class_& def(op::name operation, Function&& function, Specs&&... specs) {
@@ -2162,6 +2356,21 @@ public:
     return def_attr_writer(name, member);
   }
 
+  /// @brief Defines #each, includes Enumerable, and returns sized enumerators without a block.
+  template <auto Begin, auto End> class_& def_iterable() {
+    using item_reference = decltype(*std::invoke(Begin, std::declval<T&>()));
+    static_assert(to_ruby_convertible<item_reference>,
+                  "rbxx: iterable item type has no type_caster");
+    ID method = protect(rb_intern, "each");
+    const bool first = detail::method_registry::instance().add(
+        ruby_class_.raw(), method, std::make_unique<detail::iterable_function<T, Begin, End>>());
+    if (first) {
+      detail::define_instance_trampoline(ruby_class_.raw(), "each");
+    }
+    protect(rb_include_module, ruby_class_.raw(), rb_mEnumerable);
+    return *this;
+  }
+
 private:
   void include_comparable(op::name operation) {
     if (operation.include_comparable) {
@@ -2171,7 +2380,8 @@ private:
 
   template <typename Function>
   class_& bind_function(const char* name, Function&& function, policy::return_value_policy selected,
-                        std::vector<argument_spec> specs) {
+                        std::vector<argument_spec> specs,
+                        std::vector<detail::keep_alive_spec> keep_alive = {}) {
     using stored_function = std::decay_t<Function>;
     ID method = protect(rb_intern, name);
     if constexpr (std::is_member_function_pointer_v<stored_function>) {
@@ -2181,8 +2391,8 @@ private:
                     "rbxx: member function argument type has no type_caster");
       const bool first = detail::method_registry::instance().add(
           ruby_class_.raw(), method,
-          std::make_unique<detail::member_function<T, stored_function>>(function, selected.value,
-                                                                        std::move(specs)));
+          std::make_unique<detail::member_function<T, stored_function>>(
+              function, selected.value, std::move(specs), std::move(keep_alive)));
       if (first) {
         detail::define_instance_trampoline(ruby_class_.raw(), name);
       }
@@ -2192,7 +2402,8 @@ private:
       const bool first = detail::method_registry::instance().add(
           ruby_class_.raw(), method,
           std::make_unique<detail::self_function<T, stored_function>>(
-              std::forward<Function>(function), selected.value, std::move(specs)));
+              std::forward<Function>(function), selected.value, std::move(specs),
+              std::move(keep_alive)));
       if (first) {
         detail::define_instance_trampoline(ruby_class_.raw(), name);
       }
@@ -2241,6 +2452,153 @@ class_<T> module::def_class(const char* name, std::source_location location) {
   }                                                                                                \
   static void rbxx_init_body_##name()
 // END rbxx/extension.hpp
+
+// BEGIN rbxx/nogvl.hpp
+
+
+#include <exception>
+#include <functional>
+#include <optional>
+#include <stdexcept>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+
+namespace rbxx {
+namespace detail {
+
+struct default_unblock_function {};
+
+template <typename T> struct is_std_function : std::false_type {};
+template <typename Return, typename... Args>
+struct is_std_function<std::function<Return(Args...)>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool gvl_independent_v = !std::is_same_v<std::remove_cvref_t<T>, value> &&
+                                          !std::is_same_v<std::remove_cvref_t<T>, object> &&
+                                          !std::is_same_v<std::remove_cvref_t<T>, block> &&
+                                          !std::is_same_v<std::remove_cvref_t<T>, optional_block> &&
+                                          !std::is_same_v<std::remove_cvref_t<T>, args> &&
+                                          !is_std_function<std::remove_cvref_t<T>>::value;
+
+template <typename Function, typename Unblock, typename Return, typename Tuple>
+class nogvl_adapter_impl;
+
+template <typename Function, typename Unblock, typename Return, typename... Args>
+class nogvl_adapter_impl<Function, Unblock, Return, std::tuple<Args...>> {
+public:
+  explicit nogvl_adapter_impl(Function function) : function_(std::move(function)) {
+    validate_signature();
+  }
+
+  nogvl_adapter_impl(Function function, Unblock unblock)
+      : function_(std::move(function)), unblock_(std::move(unblock)) {
+    validate_signature();
+    static_assert(std::is_nothrow_invocable_v<Unblock&>,
+                  "rbxx: nogvl interrupt function must be noexcept");
+  }
+
+  Return operator()(Args... args) {
+    payload work{this, std::tuple<Args...>{std::forward<Args>(args)...}, std::nullopt, nullptr};
+    if constexpr (std::is_same_v<Unblock, default_unblock_function>) {
+      protect([&work] { rb_thread_call_without_gvl(run, &work, RUBY_UBF_IO, nullptr); });
+    } else {
+      protect([&work, this] {
+        rb_thread_call_without_gvl(run, &work, interrupt, std::addressof(unblock_));
+      });
+    }
+    if (work.exception) {
+      std::rethrow_exception(work.exception);
+    }
+    if constexpr (!std::is_void_v<Return>) {
+      if (!work.result) {
+        throw std::runtime_error("rbxx: nogvl function was interrupted before producing a result");
+      }
+      return std::move(*work.result);
+    }
+  }
+
+private:
+  using stored_result = std::conditional_t<std::is_void_v<Return>, bool, Return>;
+
+  struct payload {
+    nogvl_adapter_impl* adapter;
+    std::tuple<Args...> arguments;
+    std::optional<stored_result> result;
+    std::exception_ptr exception;
+  };
+
+  static consteval void validate_signature() {
+    static_assert(!std::is_reference_v<Return>,
+                  "rbxx: nogvl return values must be owned C++ values");
+    static_assert(gvl_independent_v<Return>,
+                  "rbxx: nogvl return type must not access Ruby without the GVL");
+    static_assert((gvl_independent_v<Args> && ...),
+                  "rbxx: nogvl arguments must not access Ruby without the GVL");
+  }
+
+  static void* run(void* opaque) noexcept {
+    auto* work = static_cast<payload*>(opaque);
+    try {
+      if constexpr (std::is_void_v<Return>) {
+        std::apply(
+            [&](auto&&... values) {
+              std::invoke(work->adapter->function_, std::forward<Args>(values)...);
+            },
+            work->arguments);
+        work->result.emplace(true);
+      } else {
+        work->result.emplace(std::apply(
+            [&](auto&&... values) -> Return {
+              return std::invoke(work->adapter->function_, std::forward<Args>(values)...);
+            },
+            work->arguments));
+      }
+    } catch (...) {
+      work->exception = std::current_exception();
+    }
+    return nullptr;
+  }
+
+  static void interrupt(void* opaque) noexcept { std::invoke(*static_cast<Unblock*>(opaque)); }
+
+  Function function_;
+  [[no_unique_address]] Unblock unblock_{};
+};
+
+template <typename Function, typename Unblock = default_unblock_function>
+using nogvl_adapter =
+    nogvl_adapter_impl<std::decay_t<Function>, std::decay_t<Unblock>,
+                       typename resolved_function_traits<std::decay_t<Function>>::return_type,
+                       typename resolved_function_traits<std::decay_t<Function>>::args_tuple>;
+
+} // namespace detail
+
+/// @brief Wraps a pure C++ callable so its execution occurs without the Ruby GVL.
+template <typename Function> auto nogvl(Function&& function) {
+  using stored_function = std::decay_t<Function>;
+  static_assert(detail::function_signature<stored_function>,
+                "rbxx: nogvl requires a callable with a concrete signature");
+  static_assert(!std::is_member_function_pointer_v<stored_function>,
+                "rbxx: nogvl expects a free function or callable object");
+  return detail::nogvl_adapter<stored_function>{std::forward<Function>(function)};
+}
+
+/// @brief Wraps a pure C++ callable with a noexcept interruption hook.
+template <typename Function, typename Unblock>
+auto nogvl_interruptible(Function&& function, Unblock&& unblock) {
+  using stored_function = std::decay_t<Function>;
+  using stored_unblock = std::decay_t<Unblock>;
+  static_assert(detail::function_signature<stored_function>,
+                "rbxx: nogvl_interruptible requires a callable with a concrete signature");
+  static_assert(!std::is_member_function_pointer_v<stored_function>,
+                "rbxx: nogvl_interruptible expects a free function or callable object");
+  return detail::nogvl_adapter<stored_function, stored_unblock>{std::forward<Function>(function),
+                                                                std::forward<Unblock>(unblock)};
+}
+
+} // namespace rbxx
+// END rbxx/nogvl.hpp
 
 // BEGIN rbxx/stl/detail.hpp
 

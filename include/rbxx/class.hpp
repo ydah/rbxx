@@ -2,6 +2,7 @@
 
 #include <rbxx/module.hpp>
 
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -98,14 +99,18 @@ private:
 
 template <typename Bound, typename Method> class member_function final : public native_function {
 public:
-  member_function(Method method, policy::kind selected, std::vector<argument_spec> specs = {})
-      : method_(method), policy_(selected), parser_(std::move(specs)) {}
+  member_function(Method method, policy::kind selected, std::vector<argument_spec> specs = {},
+                  std::vector<keep_alive_spec> keep_alive = {})
+      : method_(method), policy_(selected), parser_(std::move(specs)),
+        keep_alive_(std::move(keep_alive)) {}
 
   [[nodiscard]] value invoke(int argc, const VALUE* argv, value self) override {
     using traits = member_method_traits<Method>;
     parsed_arguments parsed = parser_.parse(argc, argv);
     Bound& native = load_registered<Bound>(self);
-    return invoke_native(native, parsed, std::make_index_sequence<traits::arity>{});
+    value result = invoke_native(native, parsed, std::make_index_sequence<traits::arity>{});
+    apply_keep_alive(keep_alive_, result, self, argc, argv);
+    return result;
   }
 
   [[nodiscard]] std::string signature() const override { return std::string(type_name<Method>()); }
@@ -152,6 +157,7 @@ private:
   Method method_;
   policy::kind policy_;
   argument_parser<typename member_method_traits<Method>::args_tuple> parser_;
+  std::vector<keep_alive_spec> keep_alive_;
 };
 
 template <typename Tuple, std::size_t... Index>
@@ -173,8 +179,10 @@ public:
   using args = typename traits::args_tuple;
   static constexpr std::size_t ruby_arity = traits::arity - 1U;
 
-  self_function(Function function, policy::kind selected, std::vector<argument_spec> specs = {})
-      : function_(std::move(function)), policy_(selected), parser_(std::move(specs)) {
+  self_function(Function function, policy::kind selected, std::vector<argument_spec> specs = {},
+                std::vector<keep_alive_spec> keep_alive = {})
+      : function_(std::move(function)), policy_(selected), parser_(std::move(specs)),
+        keep_alive_(std::move(keep_alive)) {
     static_assert(traits::arity > 0,
                   "rbxx: instance lambda must accept self as its first argument");
     using self_argument = std::tuple_element_t<0, args>;
@@ -188,7 +196,9 @@ public:
   [[nodiscard]] value invoke(int argc, const VALUE* argv, value self) override {
     parsed_arguments parsed = parser_.parse(argc, argv);
     Bound& native = load_registered<Bound>(self);
-    return invoke_native(native, parsed, std::make_index_sequence<ruby_arity>{});
+    value result = invoke_native(native, parsed, std::make_index_sequence<ruby_arity>{});
+    apply_keep_alive(keep_alive_, result, self, argc, argv);
+    return result;
   }
 
   [[nodiscard]] std::string signature() const override {
@@ -231,6 +241,55 @@ private:
   Function function_;
   policy::kind policy_;
   argument_parser<tuple_tail_t<args>> parser_;
+  std::vector<keep_alive_spec> keep_alive_;
+};
+
+template <typename Bound, auto Begin, auto End>
+class iterable_function final : public native_function {
+public:
+  [[nodiscard]] value invoke(int, const VALUE*, value self) override {
+    if (rb_block_given_p() == 0) {
+      VALUE enumerator = protect([self] {
+        return rb_enumeratorize_with_size(self.raw(), ID2SYM(rb_intern("each")), 0, nullptr,
+                                          size_callback);
+      });
+      return value{enumerator};
+    }
+
+    Bound& native = load_registered<Bound>(self);
+    auto iterator = std::invoke(Begin, native);
+    const auto finish = std::invoke(End, native);
+    for (; iterator != finish; ++iterator) {
+      value item = to_ruby(*iterator);
+      protect(rb_yield, item.raw());
+    }
+    return self;
+  }
+
+  [[nodiscard]] std::string signature() const override { return "each()"; }
+  [[nodiscard]] bool accepts_arity(int argc) const noexcept override { return argc == 0; }
+  [[nodiscard]] int match_score(int argc, const VALUE*) const noexcept override {
+    return argc == 0 ? 0 : -1;
+  }
+  [[nodiscard]] std::size_t declared_arity() const noexcept override { return 0U; }
+
+private:
+  static VALUE size_callback(VALUE self, VALUE, VALUE) {
+    VALUE result = Qnil;
+    VALUE pending = Qnil;
+    try {
+      Bound& native = load_registered<Bound>(value{self});
+      auto first = std::invoke(Begin, native);
+      auto last = std::invoke(End, native);
+      result = to_ruby(std::distance(first, last)).raw();
+    } catch (...) {
+      pending = translate_current_exception();
+    }
+    if (!NIL_P(pending)) {
+      rb_exc_raise(pending);
+    }
+    return result;
+  }
 };
 
 } // namespace detail
@@ -277,6 +336,24 @@ public:
                          detail::make_argument_specs(std::forward<Specs>(specs)...));
   }
 
+  template <typename Function, std::size_t Nurse, std::size_t Patient, typename... Specs>
+    requires((std::is_convertible_v<Specs, argument_spec>) && ...)
+  class_& def(const char* name, Function&& function, policy::return_value_policy selected,
+              keep_alive<Nurse, Patient> lifetime, Specs&&... specs) {
+    return bind_function(name, std::forward<Function>(function), selected,
+                         detail::make_argument_specs(std::forward<Specs>(specs)...),
+                         {detail::make_keep_alive_spec(lifetime)});
+  }
+
+  template <typename Function, std::size_t Nurse, std::size_t Patient, typename... Specs>
+    requires((std::is_convertible_v<Specs, argument_spec>) && ...)
+  class_& def(const char* name, Function&& function, keep_alive<Nurse, Patient> lifetime,
+              Specs&&... specs) {
+    return bind_function(name, std::forward<Function>(function), policy::automatic,
+                         detail::make_argument_specs(std::forward<Specs>(specs)...),
+                         {detail::make_keep_alive_spec(lifetime)});
+  }
+
   template <typename Function, typename... Specs>
     requires((std::is_convertible_v<Specs, argument_spec>) && ...)
   class_& def(op::name operation, Function&& function, Specs&&... specs) {
@@ -320,6 +397,21 @@ public:
     return def_attr_writer(name, member);
   }
 
+  /// @brief Defines #each, includes Enumerable, and returns sized enumerators without a block.
+  template <auto Begin, auto End> class_& def_iterable() {
+    using item_reference = decltype(*std::invoke(Begin, std::declval<T&>()));
+    static_assert(to_ruby_convertible<item_reference>,
+                  "rbxx: iterable item type has no type_caster");
+    ID method = protect(rb_intern, "each");
+    const bool first = detail::method_registry::instance().add(
+        ruby_class_.raw(), method, std::make_unique<detail::iterable_function<T, Begin, End>>());
+    if (first) {
+      detail::define_instance_trampoline(ruby_class_.raw(), "each");
+    }
+    protect(rb_include_module, ruby_class_.raw(), rb_mEnumerable);
+    return *this;
+  }
+
 private:
   void include_comparable(op::name operation) {
     if (operation.include_comparable) {
@@ -329,7 +421,8 @@ private:
 
   template <typename Function>
   class_& bind_function(const char* name, Function&& function, policy::return_value_policy selected,
-                        std::vector<argument_spec> specs) {
+                        std::vector<argument_spec> specs,
+                        std::vector<detail::keep_alive_spec> keep_alive = {}) {
     using stored_function = std::decay_t<Function>;
     ID method = protect(rb_intern, name);
     if constexpr (std::is_member_function_pointer_v<stored_function>) {
@@ -339,8 +432,8 @@ private:
                     "rbxx: member function argument type has no type_caster");
       const bool first = detail::method_registry::instance().add(
           ruby_class_.raw(), method,
-          std::make_unique<detail::member_function<T, stored_function>>(function, selected.value,
-                                                                        std::move(specs)));
+          std::make_unique<detail::member_function<T, stored_function>>(
+              function, selected.value, std::move(specs), std::move(keep_alive)));
       if (first) {
         detail::define_instance_trampoline(ruby_class_.raw(), name);
       }
@@ -350,7 +443,8 @@ private:
       const bool first = detail::method_registry::instance().add(
           ruby_class_.raw(), method,
           std::make_unique<detail::self_function<T, stored_function>>(
-              std::forward<Function>(function), selected.value, std::move(specs)));
+              std::forward<Function>(function), selected.value, std::move(specs),
+              std::move(keep_alive)));
       if (first) {
         detail::define_instance_trampoline(ruby_class_.raw(), name);
       }

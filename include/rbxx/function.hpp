@@ -5,6 +5,7 @@
 #include <rbxx/policies.hpp>
 
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -17,6 +18,57 @@
 #include <vector>
 
 namespace rbxx::detail {
+
+struct keep_alive_spec {
+  std::size_t nurse;
+  std::size_t patient;
+};
+
+template <std::size_t Nurse, std::size_t Patient>
+constexpr keep_alive_spec make_keep_alive_spec(keep_alive<Nurse, Patient>) noexcept {
+  return {Nurse, Patient};
+}
+
+inline value keep_alive_value(std::size_t index, value result, value self, int argc,
+                              const VALUE* argv) {
+  if (index == 0U) {
+    return result;
+  }
+  if (index == 1U) {
+    return self;
+  }
+  const std::size_t argument = index - 2U;
+  if (argument >= static_cast<std::size_t>(argc)) {
+    throw std::out_of_range("rbxx: keep_alive index exceeds the Ruby argument count");
+  }
+  return value{argv[argument]};
+}
+
+inline void apply_keep_alive(const std::vector<keep_alive_spec>& policies, value result, value self,
+                             int argc, const VALUE* argv) {
+  for (const keep_alive_spec& selected : policies) {
+    value nurse = keep_alive_value(selected.nurse, result, self, argc, argv);
+    value patient = keep_alive_value(selected.patient, result, self, argc, argv);
+    if (nurse.is_nil() || patient.is_nil()) {
+      continue;
+    }
+    if (selected.nurse > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
+      throw std::out_of_range("rbxx: keep_alive nurse index is too large");
+    }
+    std::string name = "@__rbxx_keep_" + std::to_string(selected.nurse);
+    protect([nurse, patient, &name] {
+      ID id = rb_intern(name.c_str());
+      VALUE storage = rb_ivar_get(nurse.raw(), id);
+      if (NIL_P(storage)) {
+        storage = rb_ary_new();
+        rb_ivar_set(nurse.raw(), id, storage);
+      } else if (!RB_TYPE_P(storage, T_ARRAY)) {
+        rb_raise(rb_eTypeError, "rbxx: keep_alive storage was replaced with a non-Array");
+      }
+      rb_ary_push(storage, patient.raw());
+    });
+  }
+}
 
 template <typename T> struct function_traits;
 
