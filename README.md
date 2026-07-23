@@ -1,6 +1,6 @@
 # rbxx
 
-[![CI](https://github.com/ydah/rbxx/actions/workflows/ci.yml/badge.svg)](https://github.com/ydah/rbxx/actions/workflows/ci.yml)
+[![Gem Version](https://badge.fury.io/rb/rbxx.svg)](https://badge.fury.io/rb/rbxx) [![CI](https://github.com/ydah/rbxx/actions/workflows/ci.yml/badge.svg)](https://github.com/ydah/rbxx/actions/workflows/ci.yml)
 
 rbxx is a header-only C++20 binding library for CRuby native extensions. It combines explicit
 Ruby/C++ exception boundaries, TypedData ownership, STL conversion, keyword arguments, callbacks,
